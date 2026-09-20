@@ -31,3 +31,13 @@ Table_Node* pool_alloc_node(void) { //bitmap search func for free node
     }
     return NULL;  // Every node slot is already in use
 }
+void pool_free_node(Table_Node *node) {
+    if (!node) return; // no node to free return nothing
+    
+    ptrdiff_t index = node - node_pool; //locate which node within a given pool
+    if (index < 0 || index >= max_table_nodes) return;
+
+    int array_idx = index / 64; //find bitmap 
+    int bit_idx = index % 64; //find bit in bitmap
+    bitmap[array_idx] &= ~(1ULL << bit_idx); //set bit to free
+}
