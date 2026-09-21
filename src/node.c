@@ -13,7 +13,7 @@ static void local_memset(void *ptr, int value, size_t num) { // Clear memory fun
     }
 }
 
-Table_Node* pool_alloc_node(void) { //bitmap search func for free node
+Table_Node* alloc_node(void) { //bitmap search func for free node
     for (int i = 0; i < Node_BitMap_Size; i++) {
         if (bitmap[i] != 0xFFFFFFFFFFFFFFFFULL) { //check if all 64 nodes are taken
             for (int bit = 0; bit < 64; bit++) {
@@ -31,7 +31,7 @@ Table_Node* pool_alloc_node(void) { //bitmap search func for free node
     }
     return NULL;  // Every node slot is already in use
 }
-void pool_free_node(Table_Node *node) {
+void free_node(Table_Node *node) {
     if (!node) return; // no node to free return nothing
     
     ptrdiff_t index = node - node_pool; //locate which node within a given pool
