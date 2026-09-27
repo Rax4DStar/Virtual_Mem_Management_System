@@ -52,11 +52,17 @@ typedef struct{
     asid_t asid;
     bool valid;
     bool global_page;
+    // Cache the access controls with the translation so TLB hits enforce them too.
+    bool readable;
+    bool writeable;
+    bool executable;
+    bool user_mode;
 } TLB_Entry; //define TLB to cache translations 
 
 typedef struct{
     Page_Entry *pte; //point to page entry
     uint64_t owner_va;
+    asid_t owner_asid; //address space whose translation must be invalidated
     bool busy;
 } FrameTracker; //track frame ownership and if occupied or not
 

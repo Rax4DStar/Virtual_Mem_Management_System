@@ -7,7 +7,11 @@
 #include <inttypes.h>
 
 static FrameTracker frame_table[max_frames];
-static uint8_t physical_memory[max_frames][page_size];
+// Translation combines a frame base with the page offset, so every frame must
+// begin at an address whose low page-offset bits are zero.
+_Static_assert((page_size & (page_size - 1)) == 0,
+	"page_size must be a power of two for aligned frame addressing");
+static _Alignas(page_size) uint8_t physical_memory[max_frames][page_size];
 static FILE *swap_file = NULL;
 static uint16_t clock_hand = 0;
 static uint32_t next_swap_offset = 0;
@@ -25,6 +29,7 @@ void vmm_init(void) {
 		frame_table[i].busy = false;
 		frame_table[i].pte = NULL;
 		frame_table[i].owner_va = 0;
+		frame_table[i].owner_asid = 0;
 	}
 }
 
@@ -46,7 +51,8 @@ Table_Node *vmm_create_process_table(void) {
 	return node;
 }
 
-void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool user_mode, bool global_page) {
+void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool executable,
+		bool user_mode, bool global_page) {
 	// Create each level so VA reaches a leaf entry.
 	uint16_t l4 = get_L4(va);
 	uint16_t l3 = get_L3(va);
@@ -77,7 +83,7 @@ void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool user_mode, bool
 	pte->present = false;
 	pte->readable = true;
 	pte->writeable = writable;
-	pte->executable = false;
+	pte->executable = executable;
 	pte->user_mode = user_mode;
 	pte->global_page = global_page;
 	pte->accessed = false;
@@ -97,13 +103,14 @@ void vmm_destroy_page_table(Table_Node *table, int level) {
 
 			// Only resident(not swapped) pages own frames
 			for (int frame_idx = 0; frame_idx < max_frames; frame_idx++) {
-				FrameTracker *frame = &frame_table[frame_idx];
-				if (frame->busy && frame->pte == entry) {
-					tlb_invalidate_asid(frame->owner_va >> 12, current_asid);
+			FrameTracker *frame = &frame_table[frame_idx];
+			if (frame->busy && frame->pte == entry) {
+				tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
 					physical_free_frame(frame_idx);
 					frame->busy = false;
 					frame->pte = NULL;
 					frame->owner_va = 0;
+					frame->owner_asid = 0;
 					break;
 				}
 			}
@@ -141,7 +148,7 @@ static uint8_t vmm_evict_frame(void) {
 				pte->swapped = true;
 
 				// Drop the cached translation so cant point to reused frame
-				tlb_invalidate_asid(frame->owner_va >> 12, current_asid);
+				tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
 				clock_hand = (clock_hand + 1) % max_frames;
 				return victim;
 			}
@@ -188,6 +195,7 @@ uint64_t vmm_handle_page_fault(Table_Node *root, uint64_t va, Access_Type access
 	frame_table[frame_idx].busy = true;
 	frame_table[frame_idx].pte = pte;
 	frame_table[frame_idx].owner_va = va;
+	frame_table[frame_idx].owner_asid = current_asid;
 
 	// Return the frame base; the MMU adds the virtual page offset
 	return pte->address;

@@ -7,7 +7,9 @@ void vmm_init(void);
 void vmm_cleanup(void); 
 
 Table_Node* vmm_create_process_table(void); //create root pagetable
-void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool user_mode, bool global_page); 
+// Configure access permissions for a virtual page; its frame is allocated on first access.
+void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool executable,
+              bool user_mode, bool global_page);
 //forms a map VA-->mmap-->page tables-->page entry-->physical frame. 
 
 void vmm_destroy_page_table(Table_Node *table, int level);

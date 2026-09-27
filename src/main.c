@@ -20,9 +20,9 @@ int main(void) {
 	uint64_t kernel_va = 0xFFFF80000000;
 
 	// Map writable user memory, read-only user memory, and a global kernel page
-	vmm_mmap(proc1.root, user_va_code, true, true, false);
-	vmm_mmap(proc1.root, user_va_rodata, false, true, false);
-	vmm_mmap(proc1.root, kernel_va, true, false, true);
+	vmm_mmap(proc1.root, user_va_code, true, true, true, false);
+	vmm_mmap(proc1.root, user_va_rodata, false, false, true, false);
+	vmm_mmap(proc1.root, kernel_va, true, false, false, true);
 
 	// First access allocates a physical frame for this virtual page
 	printf("=== 1. Translating Writable User Page ===\n");
