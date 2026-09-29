@@ -14,7 +14,7 @@
 #define max_frames 128
 #define max_table_nodes 256
 
-#define get_L4(va) (((va)>>39)& 0x1FF) //shift bits to lower end.
+#define get_L4(va) (((va)>>39)& 0x1FF) //shift bits to lower end
 #define get_L3(va) (((va)>>30)& 0x1FF)
 #define get_L2(va) (((va)>>21)& 0x1FF)
 #define get_L1(va) (((va)>>12)& 0x1FF)
@@ -40,6 +40,7 @@ typedef struct{
     bool dirty;
     bool swapped;
     uint32_t swap_offset;
+    int16_t frame_index; //resident frame slot, or -1 when not resident
 } Page_Entry; //page table entry representation
 
 typedef struct Table_Node{
@@ -52,7 +53,7 @@ typedef struct{
     asid_t asid;
     bool valid;
     bool global_page;
-    // Cache the access controls with the translation so TLB hits enforce them too.
+    // Cache the access controls with the translation so TLB hits enforce them too
     bool readable;
     bool writeable;
     bool executable;
@@ -63,6 +64,8 @@ typedef struct{
     Page_Entry *pte; //point to page entry
     uint64_t owner_va;
     asid_t owner_asid; //address space whose translation must be invalidated
+    int16_t replacement_prev;
+    int16_t replacement_next;
     bool busy;
 } FrameTracker; //track frame ownership and if occupied or not
 

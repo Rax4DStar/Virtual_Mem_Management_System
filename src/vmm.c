@@ -7,18 +7,49 @@
 #include <inttypes.h>
 
 static FrameTracker frame_table[max_frames];
-// Translation combines a frame base with the page offset, so every frame must
-// begin at an address whose low page-offset bits are zero.
+/* Translation combines a frame base with the page offset, so every frame must
+ begin at an address whose low page-offset bits are zero */
 _Static_assert((page_size & (page_size - 1)) == 0,
 	"page_size must be a power of two for aligned frame addressing");
 static _Alignas(page_size) uint8_t physical_memory[max_frames][page_size];
 static FILE *swap_file = NULL;
-static uint16_t clock_hand = 0;
+// Resident frames form a FIFO queue so victim selection does not scan frames
+static int16_t replacement_head = -1;
+static int16_t replacement_tail = -1;
 static uint32_t next_swap_offset = 0;
+
+static void replacement_remove(int frame_idx) {
+	FrameTracker *frame = &frame_table[frame_idx];
+	if (frame->replacement_prev >= 0) {
+		frame_table[frame->replacement_prev].replacement_next = frame->replacement_next;
+	} else {
+		replacement_head = frame->replacement_next;
+	}
+	if (frame->replacement_next >= 0) {
+		frame_table[frame->replacement_next].replacement_prev = frame->replacement_prev;
+	} else {
+		replacement_tail = frame->replacement_prev;
+	}
+	frame->replacement_prev = -1;
+	frame->replacement_next = -1;
+}
+
+static void replacement_append(int frame_idx) {
+	FrameTracker *frame = &frame_table[frame_idx];
+	frame->replacement_prev = replacement_tail;
+	frame->replacement_next = -1;
+	if (replacement_tail >= 0) {
+		frame_table[replacement_tail].replacement_next = (int16_t)frame_idx;
+	} else {
+		replacement_head = (int16_t)frame_idx;
+	}
+	replacement_tail = (int16_t)frame_idx;
+}
 
 void vmm_init(void) {
 	// Start with an empty TLB and reset frame ownership
 	tlb_init();
+	physical_frame_allocator_init();
 	swap_file = fopen("swap.bin", "w+b");
 	if (!swap_file) {
 		perror("Failed to open swap.bin");
@@ -30,7 +61,11 @@ void vmm_init(void) {
 		frame_table[i].pte = NULL;
 		frame_table[i].owner_va = 0;
 		frame_table[i].owner_asid = 0;
+		frame_table[i].replacement_prev = -1;
+		frame_table[i].replacement_next = -1;
 	}
+	replacement_head = -1;
+	replacement_tail = -1;
 }
 
 void vmm_cleanup(void) {
@@ -53,7 +88,7 @@ Table_Node *vmm_create_process_table(void) {
 
 void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool executable,
 		bool user_mode, bool global_page) {
-	// Create each level so VA reaches a leaf entry.
+	// Create each level so VA reaches a leaf entry
 	uint16_t l4 = get_L4(va);
 	uint16_t l3 = get_L3(va);
 	uint16_t l2 = get_L2(va);
@@ -81,6 +116,7 @@ void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool executable,
 	// Record permissions now.Physical page is allocated on first access
 	pte->address = 0;
 	pte->present = false;
+	pte->frame_index = -1;
 	pte->readable = true;
 	pte->writeable = writable;
 	pte->executable = executable;
@@ -101,19 +137,21 @@ void vmm_destroy_page_table(Table_Node *table, int level) {
 		if (level == 1) {
 			if (!entry->present) continue;
 
-			// Only resident(not swapped) pages own frames
-			for (int frame_idx = 0; frame_idx < max_frames; frame_idx++) {
-			FrameTracker *frame = &frame_table[frame_idx];
-			if (frame->busy && frame->pte == entry) {
-				tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
+			// The PTE records its resident frame, avoiding a scan of all frames
+			int frame_idx = entry->frame_index;
+			if (frame_idx >= 0 && frame_idx < max_frames) {
+				FrameTracker *frame = &frame_table[frame_idx];
+				if (frame->busy && frame->pte == entry) {
+					replacement_remove(frame_idx);
+					tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
 					physical_free_frame(frame_idx);
 					frame->busy = false;
 					frame->pte = NULL;
 					frame->owner_va = 0;
 					frame->owner_asid = 0;
-					break;
 				}
 			}
+			entry->frame_index = -1;
 		} else if (entry->present) {
 			// Walk down to child tables before returning this node to the pool
 			vmm_destroy_page_table((Table_Node *)entry->address, level - 1);
@@ -124,38 +162,40 @@ void vmm_destroy_page_table(Table_Node *table, int level) {
 }
 
 static uint8_t vmm_evict_frame(void) {
-	while (true) {
-		FrameTracker *frame = &frame_table[clock_hand];
-		Page_Entry *pte = frame->pte;
-
-		if (frame->busy && pte) {
-			// Give recently accessed pages a second chance via clock policy
-			if (pte->accessed) {
-				pte->accessed = false;
-			} else {
-				uint8_t victim = (uint8_t)clock_hand;
-
-				// Save the page before reusing its physical frame
-				if (fseek(swap_file, (long)next_swap_offset, SEEK_SET) != 0 ||
-					fwrite(physical_memory[victim], 1, page_size, swap_file) != page_size) {
-					perror("Failed to write page to swap");
-					exit(EXIT_FAILURE);
-				}
-				pte->swap_offset = next_swap_offset;
-				next_swap_offset += page_size;
-				pte->dirty = false;
-				pte->present = false;
-				pte->swapped = true;
-
-				// Drop the cached translation so cant point to reused frame
-				tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
-				clock_hand = (clock_hand + 1) % max_frames;
-				return victim;
-			}
-		}
-
-		clock_hand = (clock_hand + 1) % max_frames;
+	if (replacement_head < 0) {
+		fprintf(stderr, "[VMM Error] No resident frame is available to evict.\n");
+		exit(EXIT_FAILURE);
 	}
+
+	uint8_t victim = (uint8_t)replacement_head;
+	FrameTracker *frame = &frame_table[victim];
+	Page_Entry *pte = frame->pte;
+	if (!frame->busy || !pte) {
+		fprintf(stderr, "[VMM Error] Replacement queue contains an invalid frame.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	// FIFO gives fixed-time victim selection; swap I/O still depends on the file
+	if (fseek(swap_file, (long)next_swap_offset, SEEK_SET) != 0 ||
+		fwrite(physical_memory[victim], 1, page_size, swap_file) != page_size) {
+		perror("Failed to write page to swap");
+		exit(EXIT_FAILURE);
+	}
+	pte->swap_offset = next_swap_offset;
+	next_swap_offset += page_size;
+	pte->dirty = false;
+	pte->present = false;
+	pte->swapped = true;
+	pte->frame_index = -1;
+
+	// Remove the old owner and its cached translation before frame reuse
+	tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
+	replacement_remove(victim);
+	frame->busy = false;
+	frame->pte = NULL;
+	frame->owner_va = 0;
+	frame->owner_asid = 0;
+	return victim;
 }
 
 uint64_t vmm_handle_page_fault(Table_Node *root, uint64_t va, Access_Type access) {
@@ -191,11 +231,13 @@ uint64_t vmm_handle_page_fault(Table_Node *root, uint64_t va, Access_Type access
 	pte->address = (uint64_t)physical_memory[frame_idx];
 	pte->present = true;
 	pte->swapped = false;
+	pte->frame_index = (int16_t)frame_idx;
 
 	frame_table[frame_idx].busy = true;
 	frame_table[frame_idx].pte = pte;
 	frame_table[frame_idx].owner_va = va;
 	frame_table[frame_idx].owner_asid = current_asid;
+	replacement_append(frame_idx);
 
 	// Return the frame base; the MMU adds the virtual page offset
 	return pte->address;
