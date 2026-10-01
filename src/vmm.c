@@ -7,6 +7,7 @@
 #include <inttypes.h>
 
 static FrameTracker frame_table[max_frames];
+Process *current_process = NULL;
 /* Translation combines a frame base with the page offset, so every frame must
  begin at an address whose low page-offset bits are zero */
 _Static_assert((page_size & (page_size - 1)) == 0,
@@ -46,8 +47,29 @@ static void replacement_append(int frame_idx) {
 	replacement_tail = (int16_t)frame_idx;
 }
 
+static void release_page_mapping(uint64_t va, Page_Entry *pte) {
+	if (pte->present && pte->frame_index >= 0 && pte->frame_index < max_frames) {
+		int frame_idx = pte->frame_index;
+		FrameTracker *frame = &frame_table[frame_idx];
+		if (frame->busy && frame->pte == pte) {
+			replacement_remove(frame_idx);
+			physical_free_frame(frame_idx);
+			frame->busy = false;
+			frame->pte = NULL;
+			frame->owner_va = 0;
+			frame->owner_asid = 0;
+		}
+	}
+
+	// Remove any cached copy before clearing the page entry.
+	tlb_invalidate_vpn(va >> 12);
+	memset(pte, 0, sizeof(*pte));
+	pte->frame_index = -1;
+}
+
 void vmm_init(void) {
 	// Start with an empty TLB and reset frame ownership
+	current_process = NULL;
 	tlb_init();
 	physical_frame_allocator_init();
 	swap_file = fopen("swap.bin", "w+b");
@@ -86,8 +108,18 @@ Table_Node *vmm_create_process_table(void) {
 	return node;
 }
 
-void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool executable,
+bool vmm_switch_process(Process *process) {
+	// Keep the root table and ASID together when changing address spaces.
+	if (!process || !process->root) return false;
+	current_process = process;
+	return true;
+}
+
+bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
 		bool user_mode, bool global_page) {
+	if (!process || !process->root) return false;
+	Table_Node *root = process->root;
+
 	// Create each level so VA reaches a leaf entry
 	uint16_t l4 = get_L4(va);
 	uint16_t l3 = get_L3(va);
@@ -113,7 +145,13 @@ void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool executable,
 	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
 
 	Page_Entry *pte = &l1_table->entries[l1];
+	if (pte->mapped) {
+		// Release the old frame and translation before changing the mapping.
+		release_page_mapping(va, pte);
+	}
+
 	// Record permissions now.Physical page is allocated on first access
+	pte->mapped = true;
 	pte->address = 0;
 	pte->present = false;
 	pte->frame_index = -1;
@@ -126,6 +164,52 @@ void vmm_mmap(Table_Node *root, uint64_t va, bool writable, bool executable,
 	pte->dirty = false;
 	pte->swapped = false;
 	pte->swap_offset = 0;
+	return true;
+}
+
+static bool table_is_empty(Table_Node *table, int level) {
+	for (int i = 0; i < max_entries; i++) {
+		if (level == 1 ? table->entries[i].mapped : table->entries[i].present) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool vmm_munmap(Process *process, uint64_t va) {
+	if (!process || !process->root) return false;
+
+	uint16_t l4 = get_L4(va);
+	uint16_t l3 = get_L3(va);
+	uint16_t l2 = get_L2(va);
+	uint16_t l1 = get_L1(va);
+	Table_Node *root = process->root;
+	if (!root->entries[l4].present) return false;
+	Table_Node *l3_table = (Table_Node *)root->entries[l4].address;
+	if (!l3_table->entries[l3].present) return false;
+	Table_Node *l2_table = (Table_Node *)l3_table->entries[l3].address;
+	if (!l2_table->entries[l2].present) return false;
+	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
+	Page_Entry *pte = &l1_table->entries[l1];
+	if (!pte->mapped) return false;
+
+	// Release a resident frame and clear any cached translation.
+	release_page_mapping(va, pte);
+
+	// Return page-table nodes that no longer contain mappings.
+	if (table_is_empty(l1_table, 1)) {
+		free_node(l1_table);
+		memset(&l2_table->entries[l2], 0, sizeof(l2_table->entries[l2]));
+	}
+	if (table_is_empty(l2_table, 2)) {
+		free_node(l2_table);
+		memset(&l3_table->entries[l3], 0, sizeof(l3_table->entries[l3]));
+	}
+	if (table_is_empty(l3_table, 3)) {
+		free_node(l3_table);
+		memset(&root->entries[l4], 0, sizeof(root->entries[l4]));
+	}
+	return true;
 }
 
 void vmm_destroy_page_table(Table_Node *table, int level) {
@@ -236,7 +320,7 @@ uint64_t vmm_handle_page_fault(Table_Node *root, uint64_t va, Access_Type access
 	frame_table[frame_idx].busy = true;
 	frame_table[frame_idx].pte = pte;
 	frame_table[frame_idx].owner_va = va;
-	frame_table[frame_idx].owner_asid = current_asid;
+	frame_table[frame_idx].owner_asid = current_process->asid;
 	replacement_append(frame_idx);
 
 	// Return the frame base; the MMU adds the virtual page offset

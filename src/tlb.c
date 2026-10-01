@@ -2,7 +2,6 @@
 #include "tlb.h"
 
 static TLB_Entry tlb[tlb_size];
-asid_t current_asid = 1;
 
 // Direct mapping avoids searching: all operations inspect only the VPN's slot
 static size_t tlb_index(uint64_t vpn) {
@@ -42,6 +41,13 @@ void tlb_insert(uint64_t vpn, const Page_Entry *pte, asid_t asid) {
 void tlb_invalidate_asid(uint64_t vpn, asid_t asid) {
     TLB_Entry *entry = &tlb[tlb_index(vpn)];
     if (entry->valid && entry->vpn == vpn && entry->asid == asid) {
+        entry->valid = false;
+    }
+}
+
+void tlb_invalidate_vpn(uint64_t vpn) {
+    TLB_Entry *entry = &tlb[tlb_index(vpn)];
+    if (entry->valid && entry->vpn == vpn) {
         entry->valid = false;
     }
 }

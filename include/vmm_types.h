@@ -30,6 +30,7 @@ typedef enum{
 
 typedef struct{
     uint64_t address; //store physical mem
+    bool mapped; //a virtual page has a mapping, even if it is not resident
     bool present;
     bool readable;
     bool writeable;
@@ -70,10 +71,10 @@ typedef struct{
 } FrameTracker; //track frame ownership and if occupied or not
 
 typedef struct{
-    asid_t asid;
+    asid_t asid; //must identify this address space in the TLB
     Table_Node *root; // point to root of process table heirarchy 
 } Process;
 
-extern asid_t current_asid; //extern informs compiler variable exists elsewhere
+extern Process *current_process; //process selected for address translation
 
 #endif

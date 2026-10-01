@@ -9,15 +9,17 @@ static void trigger_segfault(uint64_t va, const char *reason) {
 	exit(139);
 } //terminator for hardware faults
 
-uint64_t mmu_translate(Table_Node *l4_root, uint64_t va, Access_Type access_type, bool is_user) {
+uint64_t mmu_translate(uint64_t va, Access_Type access_type, bool is_user) {
 	uint64_t vpn = va >> 12;
 	uint16_t offset = get_offset(va); //get vpn and offset
-	if (!l4_root) {
+	if (!current_process || !current_process->root) {
 		trigger_segfault(va, "Unmapped Address");
 	}
+	Table_Node *l4_root = current_process->root;
+	asid_t asid = current_process->asid;
 
 	TLB_Entry cached;
-	if (tlb_lookup(vpn, current_asid, &cached)) { //check TLB hit, including cached permissions
+	if (tlb_lookup(vpn, asid, &cached)) { //check TLB hit, including cached permissions
 		if ((access_type & access_read) && !cached.readable) {
 			trigger_segfault(va, "Read Access Violation");
 		}
@@ -59,6 +61,9 @@ uint64_t mmu_translate(Table_Node *l4_root, uint64_t va, Access_Type access_type
 
     //above marks a TBL miss walk seqeunce for our MMU.
 
+	if (!pte->mapped) {
+		trigger_segfault(va, "Unmapped Address");
+	}
 	if (!pte->present) { //check if our page exists
 		vmm_handle_page_fault(l4_root, va, access_type);
 	}
@@ -80,7 +85,7 @@ uint64_t mmu_translate(Table_Node *l4_root, uint64_t va, Access_Type access_type
 	pte->accessed = true;
 	if (access_type & access_write) pte->dirty = true;  //mark page as being used/dirty
 
-	tlb_insert(vpn, pte, current_asid); //cache the translation and permissions for future hits
+	tlb_insert(vpn, pte, asid); //cache the translation and permissions for future hits
 
 	return pte->address | offset; //return physical address
 }
