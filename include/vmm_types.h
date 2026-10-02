@@ -59,6 +59,7 @@ typedef struct{
     bool writeable;
     bool executable;
     bool user_mode;
+    Page_Entry *pte; //page entry to update access flags on a TLB hit
 } TLB_Entry; //define TLB to cache translations 
 
 typedef struct{

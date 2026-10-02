@@ -32,6 +32,10 @@ uint64_t mmu_translate(uint64_t va, Access_Type access_type, bool is_user) {
 		if (is_user && !cached.user_mode) {
 			trigger_segfault(va, "Privilege Violation");
 		}
+		if (cached.pte) {
+			cached.pte->accessed = true;
+			if (access_type & access_write) cached.pte->dirty = true;
+		}
 		printf("[MMU] TLB HIT! ");
 		return cached.frame_base | offset;
 	}
@@ -88,4 +92,37 @@ uint64_t mmu_translate(uint64_t va, Access_Type access_type, bool is_user) {
 	tlb_insert(vpn, pte, asid); //cache the translation and permissions for future hits
 
 	return pte->address | offset; //return physical address
+}
+
+static bool mmu_transfer(uint64_t va, void *buffer, size_t size,
+		Access_Type access_type, bool is_user) {
+	if (size == 0) return true;
+	if (!buffer || size - 1 > UINT64_MAX - va) return false;
+
+	uint8_t *bytes = (uint8_t *)buffer;
+	while (size > 0) {
+		// Copy only to the end of this page, then translate the next one.
+		size_t chunk = page_size - get_offset(va);
+		if (chunk > size) chunk = size;
+
+		uint64_t physical_address = mmu_translate(va, access_type, is_user);
+		bool copied = access_type == access_read
+			? vmm_read_physical(physical_address, bytes, chunk)
+			: vmm_write_physical(physical_address, bytes, chunk);
+		if (!copied) return false;
+
+		va += chunk;
+		bytes += chunk;
+		size -= chunk;
+	}
+	return true;
+}
+
+bool mmu_read(uint64_t va, void *buffer, size_t size, bool is_user) {
+	return mmu_transfer(va, buffer, size, access_read, is_user);
+}
+
+bool mmu_write(uint64_t va, const void *buffer, size_t size, bool is_user) {
+	// The shared transfer routine does not modify the input bytes.
+	return mmu_transfer(va, (void *)buffer, size, access_write, is_user);
 }

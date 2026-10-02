@@ -212,6 +212,32 @@ bool vmm_munmap(Process *process, uint64_t va) {
 	return true;
 }
 
+static uint8_t *physical_memory_pointer(uint64_t address, size_t size) {
+	uintptr_t memory_start = (uintptr_t)&physical_memory[0][0];
+	uintptr_t memory_end = memory_start + sizeof(physical_memory);
+	if (address < memory_start || address > memory_end ||
+		size > memory_end - (uintptr_t)address) {
+		return NULL;
+	}
+	return (uint8_t *)(uintptr_t)address;
+}
+
+bool vmm_read_physical(uint64_t address, void *buffer, size_t size) {
+	if (size == 0) return true;
+	uint8_t *source = physical_memory_pointer(address, size);
+	if (!source || !buffer) return false;
+	memcpy(buffer, source, size);
+	return true;
+}
+
+bool vmm_write_physical(uint64_t address, const void *buffer, size_t size) {
+	if (size == 0) return true;
+	uint8_t *destination = physical_memory_pointer(address, size);
+	if (!destination || !buffer) return false;
+	memcpy(destination, buffer, size);
+	return true;
+}
+
 void vmm_destroy_page_table(Table_Node *table, int level) {
 	if (!table) return;
 

@@ -23,7 +23,7 @@ bool tlb_lookup(uint64_t vpn, asid_t asid, TLB_Entry *result) {
     return true;
 }
 
-void tlb_insert(uint64_t vpn, const Page_Entry *pte, asid_t asid) {
+void tlb_insert(uint64_t vpn, Page_Entry *pte, asid_t asid) {
     TLB_Entry *entry = &tlb[tlb_index(vpn)];
     *entry = (TLB_Entry){
         .vpn = vpn,
@@ -34,7 +34,8 @@ void tlb_insert(uint64_t vpn, const Page_Entry *pte, asid_t asid) {
         .readable = pte->readable,
         .writeable = pte->writeable,
         .executable = pte->executable,
-        .user_mode = pte->user_mode
+        .user_mode = pte->user_mode,
+        .pte = pte
     };
 }
 
