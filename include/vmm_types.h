@@ -28,6 +28,17 @@ typedef enum{
     access_exec = 1<<2
 } Access_Type; //bit flag logic to produce memory access
 
+typedef enum {
+    mmu_ok = 0,
+    mmu_fault_unmapped,
+    mmu_fault_read_permission,
+    mmu_fault_write_permission,
+    mmu_fault_execute_permission,
+    mmu_fault_privilege,
+    mmu_fault_invalid_argument,
+    mmu_fault_invalid_physical_address
+} MMU_Result;
+
 typedef struct{
     uint64_t address; //store physical mem
     bool mapped; //a virtual page has a mapping, even if it is not resident
