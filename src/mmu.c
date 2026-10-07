@@ -36,21 +36,25 @@ MMU_Result mmu_translate(uint64_t va, Access_Type access_type, bool is_user,
 		return mmu_ok;
 	}
 
-	// Missing intermediate tables mean the virtual address was never mapped.
-	uint16_t l4 = get_L4(va);
-	if (!l4_root->entries[l4].present) return mmu_fault_unmapped;
-	Table_Node *l3_table = (Table_Node *)l4_root->entries[l4].address;
+	// Global mappings resolve through their canonical owner in every process.
+	Page_Entry *pte = vmm_find_global_page(vpn);
+	if (!pte) {
+		// Missing intermediate tables mean the address was never mapped here.
+		uint16_t l4 = get_L4(va);
+		if (!l4_root->entries[l4].present) return mmu_fault_unmapped;
+		Table_Node *l3_table = (Table_Node *)l4_root->entries[l4].address;
 
-	uint16_t l3 = get_L3(va);
-	if (!l3_table->entries[l3].present) return mmu_fault_unmapped;
-	Table_Node *l2_table = (Table_Node *)l3_table->entries[l3].address;
+		uint16_t l3 = get_L3(va);
+		if (!l3_table->entries[l3].present) return mmu_fault_unmapped;
+		Table_Node *l2_table = (Table_Node *)l3_table->entries[l3].address;
 
-	uint16_t l2 = get_L2(va);
-	if (!l2_table->entries[l2].present) return mmu_fault_unmapped;
-	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
+		uint16_t l2 = get_L2(va);
+		if (!l2_table->entries[l2].present) return mmu_fault_unmapped;
+		Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
 
-	uint16_t l1 = get_L1(va);
-	Page_Entry *pte = &l1_table->entries[l1];
+		uint16_t l1 = get_L1(va);
+		pte = &l1_table->entries[l1];
+	}
 	if (!pte->mapped) return mmu_fault_unmapped;
 
 	// Check permissions before paging in a non-resident page.
@@ -59,7 +63,7 @@ MMU_Result mmu_translate(uint64_t va, Access_Type access_type, bool is_user,
 	if (permission != mmu_ok) return permission;
 
 	if (!pte->present) {
-		vmm_handle_page_fault(l4_root, va, access_type);
+		vmm_handle_page_fault(pte, va, access_type);
 	}
 
 	pte->accessed = true;

@@ -5,9 +5,27 @@
 #include "node.h"
 
 #include <inttypes.h>
+#include <limits.h>
 
 static FrameTracker frame_table[max_frames];
 Process *current_process = NULL;
+
+typedef struct {
+	Process *process;
+	Table_Node *root;
+	asid_t asid;
+} Process_Registration;
+
+typedef struct {
+	uint64_t vpn;
+	Process *owner;
+	Page_Entry *pte;
+	uint8_t state; //0 empty, 1 occupied, 2 deleted
+} Global_Mapping;
+
+#define global_mapping_capacity (max_table_nodes * max_entries)
+static Process_Registration process_registry[max_table_nodes];
+static Global_Mapping global_mappings[global_mapping_capacity];
 /* Translation combines a frame base with the page offset, so every frame must
  begin at an address whose low page-offset bits are zero */
 _Static_assert((page_size & (page_size - 1)) == 0,
@@ -17,7 +35,152 @@ static FILE *swap_file = NULL;
 // Resident frames form a FIFO queue so victim selection does not scan frames
 static int16_t replacement_head = -1;
 static int16_t replacement_tail = -1;
-static uint32_t next_swap_offset = 0;
+// A mapped page can own at most one swap slot.
+static uint64_t free_swap_offsets[max_table_nodes * max_entries];
+static size_t free_swap_count = 0;
+static uint64_t next_swap_offset = 0;
+
+static bool swap_slot_allocate(uint64_t *offset) {
+	if (free_swap_count > 0) {
+		*offset = free_swap_offsets[--free_swap_count];
+		return true;
+	}
+
+	if (next_swap_offset > (uint64_t)LONG_MAX - page_size) return false;
+	*offset = next_swap_offset;
+	next_swap_offset += page_size;
+	return true;
+}
+
+static void swap_slot_release(uint64_t offset) {
+	if (offset % page_size != 0 ||
+		free_swap_count >= max_table_nodes * max_entries) {
+		fprintf(stderr, "[VMM Error] Invalid or excessive free swap slots.\n");
+		exit(EXIT_FAILURE);
+	}
+	free_swap_offsets[free_swap_count++] = offset;
+}
+
+static bool swap_seek(uint64_t offset) {
+	return offset <= (uint64_t)LONG_MAX &&
+		fseek(swap_file, (long)offset, SEEK_SET) == 0;
+}
+
+static bool register_process(Process *process) {
+	int free_slot = -1;
+	for (int i = 0; i < max_table_nodes; i++) {
+		Process_Registration *entry = &process_registry[i];
+		if (!entry->process) {
+			if (free_slot < 0) free_slot = i;
+			continue;
+		}
+		if (entry->process == process) {
+			return entry->root == process->root && entry->asid == process->asid;
+		}
+		if (entry->asid == process->asid || entry->root == process->root) return false;
+	}
+
+	if (free_slot < 0) return false;
+	process_registry[free_slot] = (Process_Registration){
+		.process = process,
+		.root = process->root,
+		.asid = process->asid
+	};
+	return true;
+}
+
+static Global_Mapping *find_global_mapping(uint64_t vpn) {
+	size_t index = (size_t)(vpn % global_mapping_capacity);
+	for (size_t probe = 0; probe < global_mapping_capacity; probe++) {
+		Global_Mapping *entry = &global_mappings[index];
+		if (entry->state == 0) return NULL;
+		if (entry->state == 1 && entry->vpn == vpn) return entry;
+		index = (index + 1) % global_mapping_capacity;
+	}
+	return NULL;
+}
+
+static bool add_global_mapping(uint64_t vpn, Process *owner, Page_Entry *pte) {
+	size_t index = (size_t)(vpn % global_mapping_capacity);
+	size_t first_deleted = global_mapping_capacity;
+	for (size_t probe = 0; probe < global_mapping_capacity; probe++) {
+		Global_Mapping *entry = &global_mappings[index];
+		if (entry->state == 1 && entry->vpn == vpn) {
+			if (entry->owner != owner) return false;
+			entry->pte = pte;
+			return true;
+		}
+		if (entry->state == 2 && first_deleted == global_mapping_capacity) {
+			first_deleted = index;
+		}
+		if (entry->state == 0) {
+			if (first_deleted != global_mapping_capacity) index = first_deleted;
+			global_mappings[index] = (Global_Mapping){
+				.vpn = vpn,
+				.owner = owner,
+				.pte = pte,
+				.state = 1
+			};
+			return true;
+		}
+		index = (index + 1) % global_mapping_capacity;
+	}
+
+	if (first_deleted != global_mapping_capacity) {
+		global_mappings[first_deleted] = (Global_Mapping){
+			.vpn = vpn,
+			.owner = owner,
+			.pte = pte,
+			.state = 1
+		};
+		return true;
+	}
+	return false;
+}
+
+static void remove_global_mapping(uint64_t vpn, Process *owner) {
+	Global_Mapping *entry = find_global_mapping(vpn);
+	if (entry && entry->owner == owner) {
+		tlb_invalidate_vpn(vpn);
+		entry->owner = NULL;
+		entry->pte = NULL;
+		entry->state = 2;
+	}
+}
+
+static Page_Entry *find_page_entry(Table_Node *root, uint64_t va) {
+	uint16_t l4 = get_L4(va);
+	uint16_t l3 = get_L3(va);
+	uint16_t l2 = get_L2(va);
+	uint16_t l1 = get_L1(va);
+	if (!root->entries[l4].present) return NULL;
+	Table_Node *l3_table = (Table_Node *)root->entries[l4].address;
+	if (!l3_table->entries[l3].present) return NULL;
+	Table_Node *l2_table = (Table_Node *)l3_table->entries[l3].address;
+	if (!l2_table->entries[l2].present) return NULL;
+	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
+	return &l1_table->entries[l1];
+}
+
+static void unregister_process_root(Table_Node *root) {
+	for (int i = 0; i < max_table_nodes; i++) {
+		Process_Registration *entry = &process_registry[i];
+		if (entry->process && entry->root == root) {
+			if (current_process == entry->process) current_process = NULL;
+			entry->process = NULL;
+			entry->root = NULL;
+		}
+	}
+	for (size_t i = 0; i < global_mapping_capacity; i++) {
+		Global_Mapping *entry = &global_mappings[i];
+		if (entry->state == 1 && entry->owner && entry->owner->root == root) {
+			tlb_invalidate_vpn(entry->vpn);
+			entry->owner = NULL;
+			entry->pte = NULL;
+			entry->state = 2;
+		}
+	}
+}
 
 static void replacement_remove(int frame_idx) {
 	FrameTracker *frame = &frame_table[frame_idx];
@@ -60,6 +223,7 @@ static void release_page_mapping(uint64_t va, Page_Entry *pte) {
 			frame->owner_asid = 0;
 		}
 	}
+	if (pte->swapped) swap_slot_release(pte->swap_offset);
 
 	// Remove any cached copy before clearing the page entry.
 	tlb_invalidate_vpn(va >> 12);
@@ -70,8 +234,12 @@ static void release_page_mapping(uint64_t va, Page_Entry *pte) {
 void vmm_init(void) {
 	// Start with an empty TLB and reset frame ownership
 	current_process = NULL;
+	memset(process_registry, 0, sizeof(process_registry));
+	memset(global_mappings, 0, sizeof(global_mappings));
 	tlb_init();
 	physical_frame_allocator_init();
+	free_swap_count = 0;
+	next_swap_offset = 0;
 	swap_file = fopen("swap.bin", "w+b");
 	if (!swap_file) {
 		perror("Failed to open swap.bin");
@@ -111,6 +279,7 @@ Table_Node *vmm_create_process_table(void) {
 bool vmm_switch_process(Process *process) {
 	// Keep the root table and ASID together when changing address spaces.
 	if (!process || !process->root) return false;
+	if (!register_process(process)) return false;
 	current_process = process;
 	return true;
 }
@@ -118,6 +287,19 @@ bool vmm_switch_process(Process *process) {
 bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
 		bool user_mode, bool global_page) {
 	if (!process || !process->root) return false;
+	if (!register_process(process)) return false;
+	uint64_t vpn = va >> 12;
+	Global_Mapping *registered_global = find_global_mapping(vpn);
+	if (registered_global && registered_global->owner != process) return false;
+	if (registered_global && !global_page) return false;
+	if (global_page && !registered_global) {
+		for (int i = 0; i < max_table_nodes; i++) {
+			Process_Registration *entry = &process_registry[i];
+			if (!entry->process || entry->process == process) continue;
+			Page_Entry *other_pte = find_page_entry(entry->root, va);
+			if (other_pte && other_pte->mapped) return false;
+		}
+	}
 	Table_Node *root = process->root;
 
 	// Create each level so VA reaches a leaf entry
@@ -145,6 +327,7 @@ bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
 	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
 
 	Page_Entry *pte = &l1_table->entries[l1];
+	if (global_page && !add_global_mapping(vpn, process, pte)) return false;
 	if (pte->mapped) {
 		// Release the old frame and translation before changing the mapping.
 		release_page_mapping(va, pte);
@@ -192,9 +375,11 @@ bool vmm_munmap(Process *process, uint64_t va) {
 	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
 	Page_Entry *pte = &l1_table->entries[l1];
 	if (!pte->mapped) return false;
+	bool was_global = pte->global_page;
 
 	// Release a resident frame and clear any cached translation.
 	release_page_mapping(va, pte);
+	if (was_global) remove_global_mapping(va >> 12, process);
 
 	// Return page-table nodes that no longer contain mappings.
 	if (table_is_empty(l1_table, 1)) {
@@ -240,11 +425,16 @@ bool vmm_write_physical(uint64_t address, const void *buffer, size_t size) {
 
 void vmm_destroy_page_table(Table_Node *table, int level) {
 	if (!table) return;
+	if (level == 4) unregister_process_root(table);
 
 	for (int i = 0; i < max_entries; i++) {
 		Page_Entry *entry = &table->entries[i];
 
 		if (level == 1) {
+			// Unmapped swapped pages still own a slot in the backing file.
+			if (entry->mapped && entry->swapped) {
+				swap_slot_release(entry->swap_offset);
+			}
 			if (!entry->present) continue;
 
 			// The PTE records its resident frame, avoiding a scan of all frames
@@ -253,7 +443,8 @@ void vmm_destroy_page_table(Table_Node *table, int level) {
 				FrameTracker *frame = &frame_table[frame_idx];
 				if (frame->busy && frame->pte == entry) {
 					replacement_remove(frame_idx);
-					tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
+					if (entry->global_page) tlb_invalidate_vpn(frame->owner_va >> 12);
+					else tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
 					physical_free_frame(frame_idx);
 					frame->busy = false;
 					frame->pte = NULL;
@@ -285,21 +476,26 @@ static uint8_t vmm_evict_frame(void) {
 		exit(EXIT_FAILURE);
 	}
 
-	// FIFO gives fixed-time victim selection; swap I/O still depends on the file
-	if (fseek(swap_file, (long)next_swap_offset, SEEK_SET) != 0 ||
+	// Save the oldest resident page in a free or newly allocated swap slot.
+	uint64_t swap_offset;
+	if (!swap_slot_allocate(&swap_offset)) {
+		fprintf(stderr, "[VMM Error] Swap file offset limit reached.\n");
+		exit(EXIT_FAILURE);
+	}
+	if (!swap_seek(swap_offset) ||
 		fwrite(physical_memory[victim], 1, page_size, swap_file) != page_size) {
 		perror("Failed to write page to swap");
 		exit(EXIT_FAILURE);
 	}
-	pte->swap_offset = next_swap_offset;
-	next_swap_offset += page_size;
+	pte->swap_offset = swap_offset;
 	pte->dirty = false;
 	pte->present = false;
 	pte->swapped = true;
 	pte->frame_index = -1;
 
 	// Remove the old owner and its cached translation before frame reuse
-	tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
+	if (pte->global_page) tlb_invalidate_vpn(frame->owner_va >> 12);
+	else tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
 	replacement_remove(victim);
 	frame->busy = false;
 	frame->pte = NULL;
@@ -308,7 +504,7 @@ static uint8_t vmm_evict_frame(void) {
 	return victim;
 }
 
-uint64_t vmm_handle_page_fault(Table_Node *root, uint64_t va, Access_Type access) {
+uint64_t vmm_handle_page_fault(Page_Entry *pte, uint64_t va, Access_Type access) {
 	(void)access;
 	printf("[VMM Fault Handler] Demand paging VA 0x%012" PRIX64 "...\n", va);
 
@@ -317,23 +513,20 @@ uint64_t vmm_handle_page_fault(Table_Node *root, uint64_t va, Access_Type access
 		frame_idx = vmm_evict_frame();
 	}
 
-	// Walk the existing page tables to find this virtual page's entry
-	uint16_t l4 = get_L4(va);
-	uint16_t l3 = get_L3(va);
-	uint16_t l2 = get_L2(va);
-	uint16_t l1 = get_L1(va);
-	Table_Node *l3_table = (Table_Node *)root->entries[l4].address;
-	Table_Node *l2_table = (Table_Node *)l3_table->entries[l3].address;
-	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
-	Page_Entry *pte = &l1_table->entries[l1];
+	if (!pte || !pte->mapped || !current_process) {
+		fprintf(stderr, "[VMM Error] Invalid page fault target.\n");
+		exit(EXIT_FAILURE);
+	}
 
 	// Restore a swapped page, or start a new mapping with zero-filled memory
 	if (pte->swapped) {
-		if (fseek(swap_file, (long)pte->swap_offset, SEEK_SET) != 0 ||
+		if (!swap_seek(pte->swap_offset) ||
 			fread(physical_memory[frame_idx], 1, page_size, swap_file) != page_size) {
 			perror("Failed to read page from swap");
 			exit(EXIT_FAILURE);
 		}
+		swap_slot_release(pte->swap_offset);
+		pte->swap_offset = 0;
 	} else {
 		memset(physical_memory[frame_idx], 0, page_size);
 	}
@@ -351,4 +544,11 @@ uint64_t vmm_handle_page_fault(Table_Node *root, uint64_t va, Access_Type access
 
 	// Return the frame base; the MMU adds the virtual page offset
 	return pte->address;
+}
+
+Page_Entry *vmm_find_global_page(uint64_t vpn) {
+	Global_Mapping *entry = find_global_mapping(vpn);
+	if (!entry || !entry->owner || !entry->pte || !entry->pte->mapped ||
+		!entry->pte->global_page) return NULL;
+	return entry->pte;
 }

@@ -4,6 +4,7 @@
 #include "mmu.h"
 #include "vmm.h"
 
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -113,6 +114,56 @@ static void test_process_isolation(void) {
 	vmm_cleanup();
 }
 
+static void test_live_asid_uniqueness(void) {
+	vmm_init();
+	Process first = {.asid = 21, .root = vmm_create_process_table()};
+	Process second = {.asid = 21, .root = vmm_create_process_table()};
+	check(vmm_switch_process(&first), "register first process ASID");
+	check(!vmm_switch_process(&second), "reject duplicate live ASID");
+	vmm_destroy_page_table(first.root, 4);
+	check(vmm_switch_process(&second), "allow ASID reuse after owner is destroyed");
+	vmm_destroy_page_table(second.root, 4);
+	vmm_cleanup();
+}
+
+static void test_global_mapping_rules(void) {
+	vmm_init();
+	Process owner;
+	Process other;
+	start_process(&owner, 22);
+	other.asid = 23;
+	other.root = vmm_create_process_table();
+	const uint64_t global_va = 0x900000;
+	const uint64_t conflict_va = 0xA00000;
+	check(vmm_mmap(&owner, global_va, true, false, true, true),
+		"create canonical global page");
+	const char expected[] = "shared global backing";
+	char actual[sizeof(expected)];
+	check_mmu_result(mmu_write(global_va, expected, sizeof(expected), true), mmu_ok,
+		"write canonical global contents");
+	check(vmm_mmap(&other, conflict_va, true, false, true, false),
+		"create process-local mapping before global conflict check");
+	check(!vmm_mmap(&owner, conflict_va, true, false, true, true),
+		"reject global mapping that conflicts with a local mapping");
+	check(vmm_switch_process(&other), "switch to process without global leaf tables");
+	check_mmu_result(mmu_read(global_va, actual, sizeof(actual), true), mmu_ok,
+		"read canonical global mapping from another process");
+	check(memcmp(actual, expected, sizeof(expected)) == 0,
+		"global mapping shares the same backing bytes");
+	check(!vmm_mmap(&other, global_va, true, false, true, false),
+		"reject process-local replacement of a global VA");
+	check(!vmm_mmap(&other, global_va, true, false, true, true),
+		"reject a second owner for a global VA");
+	check(vmm_switch_process(&owner), "switch to global mapping owner");
+	check(vmm_munmap(&owner, global_va), "owner unmaps global page");
+	check(vmm_switch_process(&other), "return to other process after global unmap");
+	check_mmu_result(mmu_read(global_va, actual, sizeof(actual), true),
+		mmu_fault_unmapped, "owner unmap revokes global mapping everywhere");
+	vmm_destroy_page_table(owner.root, 4);
+	vmm_destroy_page_table(other.root, 4);
+	vmm_cleanup();
+}
+
 static void test_permissions(void) {
 	vmm_init();
 	Process process;
@@ -209,14 +260,30 @@ static void test_swap_preserves_bytes(void) {
 	check_mmu_result(mmu_read(base, actual, sizeof(actual), true), mmu_ok,
 		"read evicted page back in");
 	check(memcmp(actual, expected, sizeof(expected)) == 0, "swap preserves page bytes");
+	uint64_t physical_address;
+	check_mmu_result(mmu_translate(base + page_size, access_read, true,
+		&physical_address), mmu_ok, "restore another swapped page");
+	check(vmm_munmap(&process, base + 2 * page_size),
+		"unmap a page that still owns a swap slot");
+	uint64_t new_page = base + (uint64_t)(max_frames + 1) * page_size;
+	check(vmm_mmap(&process, new_page, true, false, true, false),
+		"map another page after freeing a swap slot");
+	check_mmu_result(mmu_translate(new_page, access_read, true, &physical_address),
+		mmu_ok, "evict another page using the freed slot");
 	vmm_destroy_page_table(process.root, 4);
 	vmm_cleanup();
+	struct stat swap_file_info;
+	check(stat("swap.bin", &swap_file_info) == 0, "read swap file size");
+	check(swap_file_info.st_size == 2 * page_size,
+		"restored swap slots are reused instead of extending the file");
 }
 
 int main(void) {
 	run_case("frame allocator", test_frame_allocator);
 	run_case("fault results and invalid arguments", test_fault_results_and_arguments);
 	run_case("process isolation and switching", test_process_isolation);
+	run_case("unique ASIDs for live processes", test_live_asid_uniqueness);
+	run_case("consistent global mappings", test_global_mapping_rules);
 	run_case("read, write, execute, and privilege permissions", test_permissions);
 	run_case("remap, unmap, and map again", test_mapping_lifecycle);
 	run_case("byte access across page boundary", test_cross_page_bytes);

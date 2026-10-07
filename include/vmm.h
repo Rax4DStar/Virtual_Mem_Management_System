@@ -7,9 +7,11 @@ void vmm_init(void);
 void vmm_cleanup(void); 
 
 Table_Node* vmm_create_process_table(void); //create root pagetable
-// Select the root and ASID together; live processes should have unique ASIDs.
+// Select the root and ASID together; duplicate ASIDs or roots among live
+// processes are rejected.
 bool vmm_switch_process(Process *process);
-// Map or replace a virtual page; a frame is allocated on first access.
+// Map or replace a virtual page; a frame is allocated on first access. A
+// global VA has one canonical owning mapping shared by every process.
 bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
               bool user_mode, bool global_page);
 // Remove a mapping and release its resident frame, if it has one.
@@ -20,6 +22,8 @@ bool vmm_write_physical(uint64_t address, const void *buffer, size_t size);
 //forms a map VA-->mmap-->page tables-->page entry-->physical frame. 
 
 void vmm_destroy_page_table(Table_Node *table, int level);
-uint64_t vmm_handle_page_fault(Table_Node *root, uint64_t va, Access_Type access); 
+uint64_t vmm_handle_page_fault(Page_Entry *pte, uint64_t va, Access_Type access);
+// Resolve a globally mapped VPN to its canonical page entry.
+Page_Entry *vmm_find_global_page(uint64_t vpn);
 
 #endif

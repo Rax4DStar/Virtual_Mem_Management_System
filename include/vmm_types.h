@@ -51,7 +51,7 @@ typedef struct{
     bool accessed;
     bool dirty;
     bool swapped;
-    uint32_t swap_offset;
+    uint64_t swap_offset;
     int16_t frame_index; //resident frame slot, or -1 when not resident
 } Page_Entry; //page table entry representation
 
