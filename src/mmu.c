@@ -63,7 +63,9 @@ MMU_Result mmu_translate(uint64_t va, Access_Type access_type, bool is_user,
 	if (permission != mmu_ok) return permission;
 
 	if (!pte->present) {
-		vmm_handle_page_fault(pte, va, access_type);
+		MMU_Result fault_result = vmm_handle_page_fault(pte, va, access_type,
+			is_user, &pte->address);
+		if (fault_result != mmu_ok) return fault_result;
 	}
 
 	pte->accessed = true;

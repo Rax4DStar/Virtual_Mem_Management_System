@@ -504,19 +504,21 @@ static uint8_t vmm_evict_frame(void) {
 	return victim;
 }
 
-uint64_t vmm_handle_page_fault(Page_Entry *pte, uint64_t va, Access_Type access) {
-	(void)access;
+MMU_Result vmm_handle_page_fault(Page_Entry *pte, uint64_t va,
+		Access_Type access, bool is_user, uint64_t *frame_base) {
+	if (!pte || !pte->mapped || !current_process || !frame_base) {
+		return mmu_fault_invalid_argument;
+	}
+
+	// Recheck access before allocation so a rejected fault has no side effects.
+	if ((access & access_read) && !pte->readable) return mmu_fault_read_permission;
+	if ((access & access_write) && !pte->writeable) return mmu_fault_write_permission;
+	if ((access & access_exec) && !pte->executable) return mmu_fault_execute_permission;
+	if (is_user && !pte->user_mode) return mmu_fault_privilege;
+
 	printf("[VMM Fault Handler] Demand paging VA 0x%012" PRIX64 "...\n", va);
-
 	int frame_idx = physical_frame_alloc();
-	if (frame_idx == -1) {
-		frame_idx = vmm_evict_frame();
-	}
-
-	if (!pte || !pte->mapped || !current_process) {
-		fprintf(stderr, "[VMM Error] Invalid page fault target.\n");
-		exit(EXIT_FAILURE);
-	}
+	if (frame_idx == -1) frame_idx = vmm_evict_frame();
 
 	// Restore a swapped page, or start a new mapping with zero-filled memory
 	if (pte->swapped) {
@@ -542,8 +544,9 @@ uint64_t vmm_handle_page_fault(Page_Entry *pte, uint64_t va, Access_Type access)
 	frame_table[frame_idx].owner_asid = current_process->asid;
 	replacement_append(frame_idx);
 
-	// Return the frame base; the MMU adds the virtual page offset
-	return pte->address;
+	// Return the frame base; the MMU adds the virtual page offset.
+	*frame_base = pte->address;
+	return mmu_ok;
 }
 
 Page_Entry *vmm_find_global_page(uint64_t vpn) {
