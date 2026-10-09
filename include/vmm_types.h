@@ -57,6 +57,7 @@ typedef struct{
 
 typedef struct Table_Node{
     Page_Entry entries[max_entries]; //max no. of entries per table
+    uint16_t used_entries; // lets unmap check emptiness in constant time
 } Table_Node;
 
 typedef struct{

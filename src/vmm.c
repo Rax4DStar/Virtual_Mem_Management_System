@@ -17,6 +17,12 @@ typedef struct {
 } Process_Registration;
 
 typedef struct {
+	uintptr_t key;
+	uint16_t registry_slot;
+	uint8_t state; // 0 empty, 1 occupied, 2 deleted
+} Registration_Index_Entry;
+
+typedef struct {
 	uint64_t vpn;
 	Process *owner;
 	Page_Entry *pte;
@@ -24,7 +30,13 @@ typedef struct {
 } Global_Mapping;
 
 #define global_mapping_capacity (max_table_nodes * max_entries)
+#define registration_index_capacity (max_table_nodes * 2)
 static Process_Registration process_registry[max_table_nodes];
+static uint16_t process_by_asid[UINT16_MAX + 1u];
+static Registration_Index_Entry process_by_pointer[registration_index_capacity];
+static Registration_Index_Entry process_by_root[registration_index_capacity];
+static uint16_t free_process_slots[max_table_nodes];
+static size_t free_process_count = 0;
 static Global_Mapping global_mappings[global_mapping_capacity];
 /* Translation combines a frame base with the page offset, so every frame must
  begin at an address whose low page-offset bits are zero */
@@ -39,6 +51,9 @@ static int16_t replacement_tail = -1;
 static uint64_t free_swap_offsets[max_table_nodes * max_entries];
 static size_t free_swap_count = 0;
 static uint64_t next_swap_offset = 0;
+
+_Static_assert((registration_index_capacity & (registration_index_capacity - 1)) == 0,
+	"registration index capacity must be a power of two");
 
 static bool swap_slot_allocate(uint64_t *offset) {
 	if (free_swap_count > 0) {
@@ -66,26 +81,99 @@ static bool swap_seek(uint64_t offset) {
 		fseek(swap_file, (long)offset, SEEK_SET) == 0;
 }
 
+static size_t registration_hash(uintptr_t key) {
+	key ^= key >> 17;
+	key *= (uintptr_t)0xed5ad4bbU;
+	key ^= key >> 11;
+	key *= (uintptr_t)0xac4c1b51U;
+	key ^= key >> 15;
+	return (size_t)key & (registration_index_capacity - 1);
+}
+
+static Registration_Index_Entry *registration_index_find(
+		Registration_Index_Entry *index, uintptr_t key) {
+	size_t slot = registration_hash(key);
+	for (size_t probe = 0; probe < registration_index_capacity; probe++) {
+		Registration_Index_Entry *entry = &index[slot];
+		if (entry->state == 0) return NULL;
+		if (entry->state == 1 && entry->key == key) return entry;
+		slot = (slot + 1) & (registration_index_capacity - 1);
+	}
+	return NULL;
+}
+
+static bool registration_index_insert(Registration_Index_Entry *index,
+		uintptr_t key, uint16_t registry_slot) {
+	size_t slot = registration_hash(key);
+	size_t first_deleted = registration_index_capacity;
+	for (size_t probe = 0; probe < registration_index_capacity; probe++) {
+		Registration_Index_Entry *entry = &index[slot];
+		if (entry->state == 1 && entry->key == key) return false;
+		if (entry->state == 2 && first_deleted == registration_index_capacity) {
+			first_deleted = slot;
+		}
+		if (entry->state == 0) {
+			if (first_deleted != registration_index_capacity) slot = first_deleted;
+			index[slot] = (Registration_Index_Entry){
+				.key = key,
+				.registry_slot = registry_slot,
+				.state = 1
+			};
+			return true;
+		}
+		slot = (slot + 1) & (registration_index_capacity - 1);
+	}
+	if (first_deleted == registration_index_capacity) return false;
+	index[first_deleted] = (Registration_Index_Entry){
+		.key = key,
+		.registry_slot = registry_slot,
+		.state = 1
+	};
+	return true;
+}
+
+static void registration_index_remove(Registration_Index_Entry *entry) {
+	if (entry) entry->state = 2;
+}
+
 static bool register_process(Process *process) {
-	int free_slot = -1;
-	for (int i = 0; i < max_table_nodes; i++) {
-		Process_Registration *entry = &process_registry[i];
-		if (!entry->process) {
-			if (free_slot < 0) free_slot = i;
-			continue;
-		}
-		if (entry->process == process) {
-			return entry->root == process->root && entry->asid == process->asid;
-		}
-		if (entry->asid == process->asid || entry->root == process->root) return false;
+	uint16_t asid_slot = process_by_asid[process->asid];
+	if (asid_slot != 0) {
+		Process_Registration *entry = &process_registry[asid_slot - 1];
+		return entry->process == process && entry->root == process->root &&
+			entry->asid == process->asid;
 	}
 
-	if (free_slot < 0) return false;
-	process_registry[free_slot] = (Process_Registration){
+	Registration_Index_Entry *pointer_entry = registration_index_find(
+		process_by_pointer, (uintptr_t)process);
+	if (pointer_entry) return false; // A live process cannot change its ASID.
+	if (registration_index_find(process_by_root, (uintptr_t)process->root)) return false;
+	if (free_process_count == 0) return false;
+
+	uint16_t registry_slot = free_process_slots[--free_process_count];
+	process_registry[registry_slot] = (Process_Registration){
 		.process = process,
 		.root = process->root,
 		.asid = process->asid
 	};
+	process_by_asid[process->asid] = registry_slot + 1;
+	// Capacity is twice the maximum live process count, so each index has room.
+	if (!registration_index_insert(process_by_pointer, (uintptr_t)process,
+			registry_slot)) {
+		process_by_asid[process->asid] = 0;
+		memset(&process_registry[registry_slot], 0, sizeof(process_registry[registry_slot]));
+		free_process_slots[free_process_count++] = registry_slot;
+		return false;
+	}
+	if (!registration_index_insert(process_by_root, (uintptr_t)process->root,
+			registry_slot)) {
+		registration_index_remove(registration_index_find(process_by_pointer,
+			(uintptr_t)process));
+		process_by_asid[process->asid] = 0;
+		memset(&process_registry[registry_slot], 0, sizeof(process_registry[registry_slot]));
+		free_process_slots[free_process_count++] = registry_slot;
+		return false;
+	}
 	return true;
 }
 
@@ -163,13 +251,21 @@ static Page_Entry *find_page_entry(Table_Node *root, uint64_t va) {
 }
 
 static void unregister_process_root(Table_Node *root) {
-	for (int i = 0; i < max_table_nodes; i++) {
-		Process_Registration *entry = &process_registry[i];
-		if (entry->process && entry->root == root) {
-			if (current_process == entry->process) current_process = NULL;
-			entry->process = NULL;
-			entry->root = NULL;
+	Registration_Index_Entry *root_entry = registration_index_find(
+		process_by_root, (uintptr_t)root);
+	if (root_entry) {
+		uint16_t registry_slot = root_entry->registry_slot;
+		Process_Registration *entry = &process_registry[registry_slot];
+		Process *process = entry->process;
+		if (process && current_process == process) current_process = NULL;
+		if (process) {
+			process_by_asid[entry->asid] = 0;
+			registration_index_remove(registration_index_find(process_by_pointer,
+				(uintptr_t)process));
 		}
+		registration_index_remove(root_entry);
+		memset(entry, 0, sizeof(*entry));
+		free_process_slots[free_process_count++] = registry_slot;
 	}
 	for (size_t i = 0; i < global_mapping_capacity; i++) {
 		Global_Mapping *entry = &global_mappings[i];
@@ -235,6 +331,13 @@ void vmm_init(void) {
 	// Start with an empty TLB and reset frame ownership
 	current_process = NULL;
 	memset(process_registry, 0, sizeof(process_registry));
+	memset(process_by_asid, 0, sizeof(process_by_asid));
+	memset(process_by_pointer, 0, sizeof(process_by_pointer));
+	memset(process_by_root, 0, sizeof(process_by_root));
+	for (int i = 0; i < max_table_nodes; i++) {
+		free_process_slots[i] = (uint16_t)(max_table_nodes - 1 - i);
+	}
+	free_process_count = max_table_nodes;
 	memset(global_mappings, 0, sizeof(global_mappings));
 	tlb_init();
 	physical_frame_allocator_init();
@@ -311,23 +414,27 @@ bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
 	if (!root->entries[l4].present) {
 		root->entries[l4].address = (uint64_t)vmm_create_process_table();
 		root->entries[l4].present = true;
+		root->used_entries++;
 	}
 	Table_Node *l3_table = (Table_Node *)root->entries[l4].address;
 
 	if (!l3_table->entries[l3].present) {
 		l3_table->entries[l3].address = (uint64_t)vmm_create_process_table();
 		l3_table->entries[l3].present = true;
+		l3_table->used_entries++;
 	}
 	Table_Node *l2_table = (Table_Node *)l3_table->entries[l3].address;
 
 	if (!l2_table->entries[l2].present) {
 		l2_table->entries[l2].address = (uint64_t)vmm_create_process_table();
 		l2_table->entries[l2].present = true;
+		l2_table->used_entries++;
 	}
 	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
 
 	Page_Entry *pte = &l1_table->entries[l1];
 	if (global_page && !add_global_mapping(vpn, process, pte)) return false;
+	if (!pte->mapped) l1_table->used_entries++;
 	if (pte->mapped) {
 		// Release the old frame and translation before changing the mapping.
 		release_page_mapping(va, pte);
@@ -350,13 +457,8 @@ bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
 	return true;
 }
 
-static bool table_is_empty(Table_Node *table, int level) {
-	for (int i = 0; i < max_entries; i++) {
-		if (level == 1 ? table->entries[i].mapped : table->entries[i].present) {
-			return false;
-		}
-	}
-	return true;
+static bool table_is_empty(Table_Node *table) {
+	return table->used_entries == 0;
 }
 
 bool vmm_munmap(Process *process, uint64_t va) {
@@ -380,19 +482,23 @@ bool vmm_munmap(Process *process, uint64_t va) {
 	// Release a resident frame and clear any cached translation.
 	release_page_mapping(va, pte);
 	if (was_global) remove_global_mapping(va >> 12, process);
+	l1_table->used_entries--;
 
 	// Return page-table nodes that no longer contain mappings.
-	if (table_is_empty(l1_table, 1)) {
+	if (table_is_empty(l1_table)) {
 		free_node(l1_table);
 		memset(&l2_table->entries[l2], 0, sizeof(l2_table->entries[l2]));
+		l2_table->used_entries--;
 	}
-	if (table_is_empty(l2_table, 2)) {
+	if (table_is_empty(l2_table)) {
 		free_node(l2_table);
 		memset(&l3_table->entries[l3], 0, sizeof(l3_table->entries[l3]));
+		l3_table->used_entries--;
 	}
-	if (table_is_empty(l3_table, 3)) {
+	if (table_is_empty(l3_table)) {
 		free_node(l3_table);
 		memset(&root->entries[l4], 0, sizeof(root->entries[l4]));
+		root->used_entries--;
 	}
 	return true;
 }
