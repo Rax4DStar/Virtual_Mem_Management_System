@@ -3,12 +3,14 @@
 #include "Frame_Alloc.h"
 #include "tlb.h"
 #include "node.h"
+#include "vmm_stats_internal.h"
 
 #include <inttypes.h>
 #include <limits.h>
 
 static FrameTracker frame_table[max_frames];
 Process *current_process = NULL;
+static VMM_Stats statistics;
 
 typedef struct {
 	Process *process;
@@ -51,6 +53,24 @@ static int16_t replacement_tail = -1;
 static uint64_t free_swap_offsets[max_table_nodes * max_entries];
 static size_t free_swap_count = 0;
 static uint64_t next_swap_offset = 0;
+
+VMM_Stats vmm_get_stats(void) {
+	return statistics;
+}
+
+void vmm_reset_stats(void) {
+	memset(&statistics, 0, sizeof(statistics));
+}
+
+void vmm_stats_record_tlb_lookup(bool hit) {
+	if (hit) statistics.tlb_hits++;
+	else statistics.tlb_misses++;
+}
+
+void vmm_stats_record_transfer(bool write, size_t bytes) {
+	if (write) statistics.bytes_written += bytes;
+	else statistics.bytes_read += bytes;
+}
 
 _Static_assert((registration_index_capacity & (registration_index_capacity - 1)) == 0,
 	"registration index capacity must be a power of two");
@@ -330,6 +350,7 @@ static void release_page_mapping(uint64_t va, Page_Entry *pte) {
 void vmm_init(void) {
 	// Start with an empty TLB and reset frame ownership
 	current_process = NULL;
+	vmm_reset_stats();
 	memset(process_registry, 0, sizeof(process_registry));
 	memset(process_by_asid, 0, sizeof(process_by_asid));
 	memset(process_by_pointer, 0, sizeof(process_by_pointer));
@@ -383,6 +404,7 @@ bool vmm_switch_process(Process *process) {
 	// Keep the root table and ASID together when changing address spaces.
 	if (!process || !process->root) return false;
 	if (!register_process(process)) return false;
+	if (current_process != process) statistics.process_switches++;
 	current_process = process;
 	return true;
 }
@@ -454,6 +476,7 @@ bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
 	pte->dirty = false;
 	pte->swapped = false;
 	pte->swap_offset = 0;
+	statistics.mappings++;
 	return true;
 }
 
@@ -500,6 +523,7 @@ bool vmm_munmap(Process *process, uint64_t va) {
 		memset(&root->entries[l4], 0, sizeof(root->entries[l4]));
 		root->used_entries--;
 	}
+	statistics.unmaps++;
 	return true;
 }
 
@@ -593,6 +617,8 @@ static uint8_t vmm_evict_frame(void) {
 		perror("Failed to write page to swap");
 		exit(EXIT_FAILURE);
 	}
+	statistics.page_evictions++;
+	statistics.swap_page_outs++;
 	pte->swap_offset = swap_offset;
 	pte->dirty = false;
 	pte->present = false;
@@ -627,7 +653,8 @@ MMU_Result vmm_handle_page_fault(Page_Entry *pte, uint64_t va,
 	if (frame_idx == -1) frame_idx = vmm_evict_frame();
 
 	// Restore a swapped page, or start a new mapping with zero-filled memory
-	if (pte->swapped) {
+	bool swapped_in = pte->swapped;
+	if (swapped_in) {
 		if (!swap_seek(pte->swap_offset) ||
 			fread(physical_memory[frame_idx], 1, page_size, swap_file) != page_size) {
 			perror("Failed to read page from swap");
@@ -638,6 +665,9 @@ MMU_Result vmm_handle_page_fault(Page_Entry *pte, uint64_t va,
 	} else {
 		memset(physical_memory[frame_idx], 0, page_size);
 	}
+	statistics.page_faults++;
+	if (swapped_in) statistics.swap_page_ins++;
+	else statistics.zero_fill_page_ins++;
 
 	pte->address = (uint64_t)physical_memory[frame_idx];
 	pte->present = true;

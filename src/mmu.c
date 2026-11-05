@@ -2,6 +2,7 @@
 #include "mmu.h"
 #include "tlb.h"
 #include "vmm.h"
+#include "vmm_stats_internal.h"
 
 static MMU_Result check_permissions(Access_Type access_type, bool is_user,
 		bool readable, bool writeable, bool executable, bool user_mode) {
@@ -23,7 +24,9 @@ MMU_Result mmu_translate(uint64_t va, Access_Type access_type, bool is_user,
 	asid_t asid = current_process->asid;
 
 	TLB_Entry cached;
-	if (tlb_lookup(vpn, asid, &cached)) {
+	bool tlb_hit = tlb_lookup(vpn, asid, &cached);
+	vmm_stats_record_tlb_lookup(tlb_hit);
+	if (tlb_hit) {
 		MMU_Result permission = check_permissions(access_type, is_user,
 			cached.readable, cached.writeable, cached.executable, cached.user_mode);
 		if (permission != mmu_ok) return permission;
@@ -94,6 +97,7 @@ static MMU_Result mmu_transfer(uint64_t va, void *buffer, size_t size,
 			? vmm_read_physical(physical_address, bytes, chunk)
 			: vmm_write_physical(physical_address, bytes, chunk);
 		if (!copied) return mmu_fault_invalid_physical_address;
+		vmm_stats_record_transfer(access_type == access_write, chunk);
 
 		va += chunk;
 		bytes += chunk;

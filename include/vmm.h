@@ -3,8 +3,26 @@
 
 #include "vmm_types.h"
 
+typedef struct {
+	uint64_t process_switches;
+	uint64_t mappings;
+	uint64_t unmaps;
+	uint64_t tlb_hits;
+	uint64_t tlb_misses;
+	uint64_t page_faults;
+	uint64_t zero_fill_page_ins;
+	uint64_t swap_page_ins;
+	uint64_t page_evictions;
+	uint64_t swap_page_outs;
+	uint64_t bytes_read;
+	uint64_t bytes_written;
+} VMM_Stats;
+
 void vmm_init(void); 
 void vmm_cleanup(void); 
+// Return a snapshot of accumulated counters, or clear them for a new interval.
+VMM_Stats vmm_get_stats(void);
+void vmm_reset_stats(void);
 
 Table_Node* vmm_create_process_table(void); //create root pagetable
 // Select the root and ASID together; duplicate ASIDs or roots among live

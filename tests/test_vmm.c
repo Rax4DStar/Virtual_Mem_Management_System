@@ -238,6 +238,43 @@ static void test_cross_page_bytes(void) {
 	vmm_cleanup();
 }
 
+static void test_statistics_counters(void) {
+	vmm_init();
+	Process process;
+	start_process(&process, 24);
+	const uint64_t va = 0xB00000;
+	check(vmm_mmap(&process, va, true, false, true, false),
+		"map page for statistics test");
+	char byte = 0;
+	check_mmu_result(mmu_read(va, &byte, 1, true), mmu_ok,
+		"first read faults in a zero-filled page");
+	check_mmu_result(mmu_read(va, &byte, 1, true), mmu_ok,
+		"second read hits the TLB");
+	check_mmu_result(mmu_write(va, &byte, 1, true), mmu_ok,
+		"write hits the TLB");
+	check(vmm_munmap(&process, va), "unmap page for statistics test");
+
+	VMM_Stats stats = vmm_get_stats();
+	check(stats.process_switches == 1, "count process switches");
+	check(stats.mappings == 1 && stats.unmaps == 1,
+		"count successful map and unmap operations");
+	check(stats.tlb_misses == 1 && stats.tlb_hits == 2,
+		"count TLB hits and misses");
+	check(stats.page_faults == 1 && stats.zero_fill_page_ins == 1 &&
+		stats.swap_page_ins == 0, "count zero-fill page faults separately");
+	check(stats.bytes_read == 2 && stats.bytes_written == 1,
+		"count successfully transferred bytes");
+
+	vmm_reset_stats();
+	stats = vmm_get_stats();
+	check(stats.process_switches == 0 && stats.mappings == 0 &&
+		stats.tlb_hits == 0 && stats.page_faults == 0 &&
+		stats.bytes_read == 0 && stats.bytes_written == 0,
+		"reset clears accumulated statistics");
+	vmm_destroy_page_table(process.root, 4);
+	vmm_cleanup();
+}
+
 static void test_swap_preserves_bytes(void) {
 	vmm_init();
 	Process process;
@@ -270,6 +307,13 @@ static void test_swap_preserves_bytes(void) {
 		"map another page after freeing a swap slot");
 	check_mmu_result(mmu_translate(new_page, access_read, true, &physical_address),
 		mmu_ok, "evict another page using the freed slot");
+	VMM_Stats stats = vmm_get_stats();
+	check(stats.page_evictions > 0 &&
+		stats.swap_page_outs == stats.page_evictions,
+		"count successful page evictions and swap writes");
+	check(stats.swap_page_ins > 0 &&
+		stats.page_faults == stats.zero_fill_page_ins + stats.swap_page_ins,
+		"count pages restored from swap");
 	vmm_destroy_page_table(process.root, 4);
 	vmm_cleanup();
 	struct stat swap_file_info;
@@ -287,6 +331,7 @@ int main(void) {
 	run_case("read, write, execute, and privilege permissions", test_permissions);
 	run_case("remap, unmap, and map again", test_mapping_lifecycle);
 	run_case("byte access across page boundary", test_cross_page_bytes);
+	run_case("statistics counters and reset", test_statistics_counters);
 	run_case("swap preserves written bytes", test_swap_preserves_bytes);
 	puts("All tests passed.");
 	return EXIT_SUCCESS;

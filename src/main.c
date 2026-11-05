@@ -112,6 +112,20 @@ int main(void) {
 	printf("\n=== 5. Cleaning Up Process Memory Trees ===\n");
 	vmm_destroy_page_table(proc1.root, 4);
 	vmm_destroy_page_table(proc2.root, 4);
+	VMM_Stats stats = vmm_get_stats();
+	printf("\n=== VMM Statistics ===\n");
+	printf("Process switches: %" PRIu64 " | mappings: %" PRIu64
+		" | unmaps: %" PRIu64 "\n", stats.process_switches,
+		stats.mappings, stats.unmaps);
+	printf("TLB hits: %" PRIu64 " | misses: %" PRIu64 "\n",
+		stats.tlb_hits, stats.tlb_misses);
+	printf("Page faults: %" PRIu64 " | zero-fill: %" PRIu64
+		" | swap-in: %" PRIu64 " | evictions: %" PRIu64
+		" | swap-out: %" PRIu64 "\n", stats.page_faults,
+		stats.zero_fill_page_ins, stats.swap_page_ins,
+		stats.page_evictions, stats.swap_page_outs);
+	printf("Bytes read: %" PRIu64 " | bytes written: %" PRIu64 "\n",
+		stats.bytes_read, stats.bytes_written);
 
 	vmm_cleanup();
 	printf("Process Teardown Complete.\n");

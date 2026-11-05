@@ -1,0 +1,6 @@
+.git
+.gitignore
+.dockerignore
+build
+swap.bin
+.DS_Store
