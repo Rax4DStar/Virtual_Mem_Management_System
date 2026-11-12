@@ -14,15 +14,25 @@ typedef struct {
 	uint64_t swap_page_ins;
 	uint64_t page_evictions;
 	uint64_t swap_page_outs;
+	uint64_t clock_page_checks;
 	uint64_t bytes_read;
 	uint64_t bytes_written;
 } VMM_Stats;
+
+typedef enum {
+	vmm_replacement_fifo = 0,
+	vmm_replacement_clock = 1
+} VMM_Replacement_Policy;
 
 void vmm_init(void); 
 void vmm_cleanup(void); 
 // Return a snapshot of accumulated counters, or clear them for a new interval.
 VMM_Stats vmm_get_stats(void);
 void vmm_reset_stats(void);
+// Select FIFO or Clock; new VMM instances start with FIFO selected. Clock
+// keeps second-chance state in each page's accessed bit.
+bool vmm_set_replacement_policy(VMM_Replacement_Policy policy);
+VMM_Replacement_Policy vmm_get_replacement_policy(void);
 
 Table_Node* vmm_create_process_table(void); //create root pagetable
 // Select the root and ASID together; duplicate ASIDs or roots among live

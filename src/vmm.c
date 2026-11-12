@@ -49,6 +49,8 @@ static FILE *swap_file = NULL;
 // Resident frames form a FIFO queue so victim selection does not scan frames
 static int16_t replacement_head = -1;
 static int16_t replacement_tail = -1;
+static int16_t replacement_clock_hand = -1;
+static VMM_Replacement_Policy replacement_policy = vmm_replacement_fifo;
 // A mapped page can own at most one swap slot.
 static uint64_t free_swap_offsets[max_table_nodes * max_entries];
 static size_t free_swap_count = 0;
@@ -60,6 +62,21 @@ VMM_Stats vmm_get_stats(void) {
 
 void vmm_reset_stats(void) {
 	memset(&statistics, 0, sizeof(statistics));
+}
+
+bool vmm_set_replacement_policy(VMM_Replacement_Policy policy) {
+	if (policy != vmm_replacement_fifo && policy != vmm_replacement_clock) {
+		return false;
+	}
+	replacement_policy = policy;
+	if (replacement_policy == vmm_replacement_clock && replacement_clock_hand < 0) {
+		replacement_clock_hand = replacement_head;
+	}
+	return true;
+}
+
+VMM_Replacement_Policy vmm_get_replacement_policy(void) {
+	return replacement_policy;
 }
 
 void vmm_stats_record_tlb_lookup(bool hit) {
@@ -300,6 +317,11 @@ static void unregister_process_root(Table_Node *root) {
 
 static void replacement_remove(int frame_idx) {
 	FrameTracker *frame = &frame_table[frame_idx];
+	if (replacement_clock_hand == frame_idx) {
+		int16_t next = frame->replacement_next >= 0
+			? frame->replacement_next : replacement_head;
+		replacement_clock_hand = next == frame_idx ? -1 : next;
+	}
 	if (frame->replacement_prev >= 0) {
 		frame_table[frame->replacement_prev].replacement_next = frame->replacement_next;
 	} else {
@@ -324,6 +346,26 @@ static void replacement_append(int frame_idx) {
 		replacement_head = (int16_t)frame_idx;
 	}
 	replacement_tail = (int16_t)frame_idx;
+	if (replacement_clock_hand < 0) replacement_clock_hand = (int16_t)frame_idx;
+}
+
+static int16_t replacement_select_victim(void) {
+	if (replacement_policy == vmm_replacement_fifo) return replacement_head;
+	if (replacement_clock_hand < 0) replacement_clock_hand = replacement_head;
+	if (replacement_clock_hand < 0) return -1;
+
+	// Give referenced pages a second chance, then choose the first clear page.
+	for (;;) {
+		int16_t candidate = replacement_clock_hand;
+		FrameTracker *frame = &frame_table[candidate];
+		if (!frame->busy || !frame->pte) return -1;
+		Page_Entry *pte = frame->pte;
+		statistics.clock_page_checks++;
+		replacement_clock_hand = frame->replacement_next >= 0
+			? frame->replacement_next : replacement_head;
+		if (!pte->accessed) return candidate;
+		pte->accessed = false;
+	}
 }
 
 static void release_page_mapping(uint64_t va, Page_Entry *pte) {
@@ -380,6 +422,8 @@ void vmm_init(void) {
 	}
 	replacement_head = -1;
 	replacement_tail = -1;
+	replacement_clock_hand = -1;
+	replacement_policy = vmm_replacement_fifo;
 }
 
 void vmm_cleanup(void) {
@@ -593,12 +637,13 @@ void vmm_destroy_page_table(Table_Node *table, int level) {
 }
 
 static uint8_t vmm_evict_frame(void) {
-	if (replacement_head < 0) {
+	int16_t victim_idx = replacement_select_victim();
+	if (victim_idx < 0) {
 		fprintf(stderr, "[VMM Error] No resident frame is available to evict.\n");
 		exit(EXIT_FAILURE);
 	}
 
-	uint8_t victim = (uint8_t)replacement_head;
+	uint8_t victim = (uint8_t)victim_idx;
 	FrameTracker *frame = &frame_table[victim];
 	Page_Entry *pte = frame->pte;
 	if (!frame->busy || !pte) {

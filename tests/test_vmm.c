@@ -275,6 +275,63 @@ static void test_statistics_counters(void) {
 	vmm_cleanup();
 }
 
+static void test_clock_replacement(void) {
+	vmm_init();
+	check(vmm_get_replacement_policy() == vmm_replacement_fifo,
+		"FIFO remains the default replacement policy");
+	check(vmm_set_replacement_policy(vmm_replacement_clock),
+		"enable Clock replacement");
+	check(!vmm_set_replacement_policy((VMM_Replacement_Policy)99),
+		"reject an unsupported replacement policy");
+
+	Process process;
+	start_process(&process, 25);
+	const uint64_t base = 0x20000000;
+	for (int i = 0; i <= max_frames; i++) {
+		check(vmm_mmap(&process, base + (uint64_t)i * page_size,
+			true, false, true, false), "map page for Clock test");
+	}
+
+	// Fill RAM and give the first two pages a second chance ahead of page 2.
+	for (int i = 0; i < max_frames; i++) {
+		uint64_t physical_address;
+		check_mmu_result(mmu_translate(base + (uint64_t)i * page_size,
+			access_read, true, &physical_address), mmu_ok,
+			"touch page under Clock replacement");
+	}
+	uint16_t l4 = get_L4(base + 2 * page_size);
+	uint16_t l3 = get_L3(base + 2 * page_size);
+	uint16_t l2 = get_L2(base + 2 * page_size);
+	uint16_t l1 = get_L1(base + 2 * page_size);
+	Table_Node *l3_table = (Table_Node *)process.root->entries[l4].address;
+	Table_Node *l2_table = (Table_Node *)l3_table->entries[l3].address;
+	Table_Node *l1_table = (Table_Node *)l2_table->entries[l2].address;
+	l1_table->entries[l1].accessed = false;
+
+	uint64_t physical_address;
+	check_mmu_result(mmu_translate(base + (uint64_t)max_frames * page_size,
+		access_read, true, &physical_address), mmu_ok,
+		"fault in one more page to trigger Clock");
+	uint64_t faults_before_recheck = vmm_get_stats().page_faults;
+	check_mmu_result(mmu_translate(base, access_read, true, &physical_address),
+		mmu_ok, "first referenced page receives a second chance");
+	check_mmu_result(mmu_translate(base + page_size, access_read, true,
+		&physical_address), mmu_ok, "second referenced page stays resident");
+	check(vmm_get_stats().page_faults == faults_before_recheck,
+		"Clock evicts the unreferenced page instead of referenced pages");
+	check_mmu_result(mmu_translate(base + 2 * page_size, access_read, true,
+		&physical_address), mmu_ok, "page the unreferenced victim back in");
+	VMM_Stats stats = vmm_get_stats();
+	check(stats.page_faults == 130 && stats.zero_fill_page_ins == 129 &&
+		stats.swap_page_ins == 1, "Clock pages the unreferenced victim back in");
+	check(stats.clock_page_checks >= 3,
+		"count Clock hand inspections");
+	check(vmm_get_replacement_policy() == vmm_replacement_clock,
+		"Clock remains selected until changed");
+	vmm_destroy_page_table(process.root, 4);
+	vmm_cleanup();
+}
+
 static void test_swap_preserves_bytes(void) {
 	vmm_init();
 	Process process;
@@ -332,6 +389,7 @@ int main(void) {
 	run_case("remap, unmap, and map again", test_mapping_lifecycle);
 	run_case("byte access across page boundary", test_cross_page_bytes);
 	run_case("statistics counters and reset", test_statistics_counters);
+	run_case("Clock second-chance replacement", test_clock_replacement);
 	run_case("swap preserves written bytes", test_swap_preserves_bytes);
 	puts("All tests passed.");
 	return EXIT_SUCCESS;
