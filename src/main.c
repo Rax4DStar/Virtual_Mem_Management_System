@@ -125,6 +125,8 @@ int main(void) {
 		stats.zero_fill_page_ins, stats.swap_page_ins,
 		stats.page_evictions, stats.swap_page_outs);
 	printf("Clock page checks: %" PRIu64 "\n", stats.clock_page_checks);
+	printf("Copy-on-write faults: %" PRIu64 "\n",
+		stats.copy_on_write_faults);
 	printf("Bytes read: %" PRIu64 " | bytes written: %" PRIu64 "\n",
 		stats.bytes_read, stats.bytes_written);
 

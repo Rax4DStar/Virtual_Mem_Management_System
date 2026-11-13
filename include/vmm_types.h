@@ -39,7 +39,9 @@ typedef enum {
     mmu_fault_invalid_physical_address
 } MMU_Result;
 
-typedef struct{
+struct Shared_Page;
+
+typedef struct Page_Entry{
     uint64_t address; //store physical mem
     bool mapped; //a virtual page has a mapping, even if it is not resident
     bool present;
@@ -48,11 +50,17 @@ typedef struct{
     bool executable;
     bool user_mode;
     bool global_page;
+    bool copy_on_write; // write access must split a shared backing page
     bool accessed;
     bool dirty;
     bool swapped;
     uint64_t swap_offset;
     int16_t frame_index; //resident frame slot, or -1 when not resident
+    uint64_t vpn;
+    asid_t owner_asid;
+    struct Shared_Page *shared_page; // shared physical/swap backing, if any
+    struct Page_Entry *shared_prev; // links mappings that share that backing
+    struct Page_Entry *shared_next;
 } Page_Entry; //page table entry representation
 
 typedef struct Table_Node{
@@ -76,6 +84,7 @@ typedef struct{
 
 typedef struct{
     Page_Entry *pte; //point to page entry
+    struct Shared_Page *shared_page;
     uint64_t owner_va;
     asid_t owner_asid; //address space whose translation must be invalidated
     int16_t replacement_prev;

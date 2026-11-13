@@ -164,6 +164,102 @@ static void test_global_mapping_rules(void) {
 	vmm_cleanup();
 }
 
+static void test_shared_memory_copy_on_write(void) {
+	vmm_init();
+	Process source;
+	Process target;
+	start_process(&source, 26);
+	target.asid = 27;
+	target.root = vmm_create_process_table();
+	const uint64_t source_va = 0xC00000;
+	const uint64_t target_va = 0x1C00000;
+	check(vmm_mmap(&source, source_va, true, false, true, false),
+		"map source page");
+	const char original[] = "shared original";
+	const char changed[] = "private changed";
+	char actual[sizeof(original)];
+	check_mmu_result(mmu_write(source_va, original, sizeof(original), true),
+		mmu_ok, "initialize source page");
+	check(vmm_mmap_shared(&source, source_va, &target, target_va),
+		"map source page into target at another VA");
+	check(vmm_switch_process(&target), "switch to shared mapping target");
+	check_mmu_result(mmu_read(target_va, actual, sizeof(actual), true), mmu_ok,
+		"read shared page from target");
+	check(memcmp(actual, original, sizeof(original)) == 0,
+		"target initially sees source bytes");
+	uint64_t source_pa;
+	uint64_t target_pa;
+	check_mmu_result(mmu_translate(target_va, access_read, true, &target_pa),
+		mmu_ok, "translate target shared page");
+	check(vmm_switch_process(&source), "switch back to source mapping");
+	check_mmu_result(mmu_translate(source_va, access_read, true, &source_pa),
+		mmu_ok, "translate source shared page");
+	check(source_pa == target_pa, "shared mappings refer to one physical frame");
+	check(vmm_switch_process(&target), "switch to target for a private write");
+	check_mmu_result(mmu_write(target_va, changed, sizeof(changed), true), mmu_ok,
+		"write to shared page triggers copy-on-write");
+	check_mmu_result(mmu_read(target_va, actual, sizeof(actual), true), mmu_ok,
+		"read target private copy");
+	check(memcmp(actual, changed, sizeof(changed)) == 0,
+		"target sees its private modified bytes");
+	check(vmm_switch_process(&source), "switch to original source");
+	check_mmu_result(mmu_read(source_va, actual, sizeof(actual), true), mmu_ok,
+		"read source after target copy-on-write");
+	check(memcmp(actual, original, sizeof(original)) == 0,
+		"target write leaves source bytes unchanged");
+	check(vmm_get_stats().copy_on_write_faults == 1,
+		"count the copy-on-write split");
+	vmm_destroy_page_table(source.root, 4);
+	vmm_destroy_page_table(target.root, 4);
+	vmm_cleanup();
+}
+
+static void test_shared_page_swap(void) {
+	vmm_init();
+	Process source;
+	Process target;
+	start_process(&source, 28);
+	target.asid = 29;
+	target.root = vmm_create_process_table();
+	const uint64_t base = 0x30000000;
+	const uint64_t target_va = 0x40000000;
+	const char original[] = "shared data survives swap";
+	const char changed[] = "target owns new contents";
+	char actual[sizeof(original)];
+	check(vmm_mmap(&source, base, true, false, true, false),
+		"map page to share before eviction");
+	check_mmu_result(mmu_write(base, original, sizeof(original), true), mmu_ok,
+		"write shared page before eviction");
+	check(vmm_mmap_shared(&source, base, &target, target_va),
+		"create shared backing before eviction");
+	for (int i = 1; i <= max_frames; i++) {
+		uint64_t va = base + (uint64_t)i * page_size;
+		uint64_t physical_address;
+		check(vmm_mmap(&source, va, true, false, true, false),
+			"map page to force shared eviction");
+		check_mmu_result(mmu_translate(va, access_read, true, &physical_address),
+			mmu_ok, "touch page to force shared eviction");
+	}
+	check(vmm_switch_process(&target), "switch to target after source eviction");
+	check_mmu_result(mmu_read(target_va, actual, sizeof(actual), true), mmu_ok,
+		"page shared backing in through target mapping");
+	check(memcmp(actual, original, sizeof(original)) == 0,
+		"swap-in restores shared bytes for target");
+	check_mmu_result(mmu_write(target_va, changed, sizeof(changed), true), mmu_ok,
+		"copy-on-write a swapped shared page");
+	check(vmm_switch_process(&source), "switch to source after target split");
+	check_mmu_result(mmu_read(base, actual, sizeof(actual), true), mmu_ok,
+		"read source after swapped copy-on-write");
+	check(memcmp(actual, original, sizeof(original)) == 0,
+		"copy-on-write after swap preserves the source page");
+	VMM_Stats stats = vmm_get_stats();
+	check(stats.swap_page_ins >= 1 && stats.copy_on_write_faults == 1,
+		"count shared swap-in and copy-on-write");
+	vmm_destroy_page_table(source.root, 4);
+	vmm_destroy_page_table(target.root, 4);
+	vmm_cleanup();
+}
+
 static void test_permissions(void) {
 	vmm_init();
 	Process process;
@@ -385,6 +481,8 @@ int main(void) {
 	run_case("process isolation and switching", test_process_isolation);
 	run_case("unique ASIDs for live processes", test_live_asid_uniqueness);
 	run_case("consistent global mappings", test_global_mapping_rules);
+	run_case("shared pages and copy-on-write isolation", test_shared_memory_copy_on_write);
+	run_case("shared backing survives swap and copy-on-write", test_shared_page_swap);
 	run_case("read, write, execute, and privilege permissions", test_permissions);
 	run_case("remap, unmap, and map again", test_mapping_lifecycle);
 	run_case("byte access across page boundary", test_cross_page_bytes);

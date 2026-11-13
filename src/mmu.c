@@ -26,13 +26,18 @@ MMU_Result mmu_translate(uint64_t va, Access_Type access_type, bool is_user,
 	TLB_Entry cached;
 	bool tlb_hit = tlb_lookup(vpn, asid, &cached);
 	vmm_stats_record_tlb_lookup(tlb_hit);
-	if (tlb_hit) {
+	if (tlb_hit && (access_type & access_write) && cached.pte &&
+		cached.pte->copy_on_write) {
+		MMU_Result cow_result = vmm_resolve_copy_on_write(cached.pte,
+			access_type, is_user);
+		if (cow_result != mmu_ok) return cow_result;
+	} else if (tlb_hit) {
 		MMU_Result permission = check_permissions(access_type, is_user,
 			cached.readable, cached.writeable, cached.executable, cached.user_mode);
 		if (permission != mmu_ok) return permission;
 
 		if (cached.pte) {
-			cached.pte->accessed = true;
+			vmm_note_page_access(cached.pte);
 			if (access_type & access_write) cached.pte->dirty = true;
 		}
 		*physical_address = cached.frame_base | offset;
@@ -60,10 +65,16 @@ MMU_Result mmu_translate(uint64_t va, Access_Type access_type, bool is_user,
 	}
 	if (!pte->mapped) return mmu_fault_unmapped;
 
-	// Check permissions before paging in a non-resident page.
-	MMU_Result permission = check_permissions(access_type, is_user,
-		pte->readable, pte->writeable, pte->executable, pte->user_mode);
-	if (permission != mmu_ok) return permission;
+	if ((access_type & access_write) && pte->copy_on_write) {
+		MMU_Result cow_result = vmm_resolve_copy_on_write(pte,
+			access_type, is_user);
+		if (cow_result != mmu_ok) return cow_result;
+	} else {
+		// Check permissions before paging in a non-resident page.
+		MMU_Result permission = check_permissions(access_type, is_user,
+			pte->readable, pte->writeable, pte->executable, pte->user_mode);
+		if (permission != mmu_ok) return permission;
+	}
 
 	if (!pte->present) {
 		MMU_Result fault_result = vmm_handle_page_fault(pte, va, access_type,
@@ -71,7 +82,7 @@ MMU_Result mmu_translate(uint64_t va, Access_Type access_type, bool is_user,
 		if (fault_result != mmu_ok) return fault_result;
 	}
 
-	pte->accessed = true;
+	vmm_note_page_access(pte);
 	if (access_type & access_write) pte->dirty = true;
 	tlb_insert(vpn, pte, asid);
 	*physical_address = pte->address | offset;

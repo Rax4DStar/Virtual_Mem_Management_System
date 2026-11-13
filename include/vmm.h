@@ -15,6 +15,7 @@ typedef struct {
 	uint64_t page_evictions;
 	uint64_t swap_page_outs;
 	uint64_t clock_page_checks;
+	uint64_t copy_on_write_faults;
 	uint64_t bytes_read;
 	uint64_t bytes_written;
 } VMM_Stats;
@@ -42,6 +43,11 @@ bool vmm_switch_process(Process *process);
 // global VA has one canonical owning mapping shared by every process.
 bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
               bool user_mode, bool global_page);
+// Map source_va into target_va using one backing page. Writable source pages
+// become copy-on-write in both processes until either process writes. The
+// source must be local, and target_va must not currently be mapped.
+bool vmm_mmap_shared(Process *source, uint64_t source_va,
+		Process *target, uint64_t target_va);
 // Remove a mapping and release its resident frame, if it has one.
 bool vmm_munmap(Process *process, uint64_t va);
 // Copy bytes between a translated physical address and simulated memory.
@@ -52,6 +58,9 @@ bool vmm_write_physical(uint64_t address, const void *buffer, size_t size);
 void vmm_destroy_page_table(Table_Node *table, int level);
 MMU_Result vmm_handle_page_fault(Page_Entry *pte, uint64_t va,
 		Access_Type access, bool is_user, uint64_t *frame_base);
+// Resolve a write to a copy-on-write shared mapping.
+MMU_Result vmm_resolve_copy_on_write(Page_Entry *pte, Access_Type access,
+		bool is_user);
 // Resolve a globally mapped VPN to its canonical page entry.
 Page_Entry *vmm_find_global_page(uint64_t vpn);
 

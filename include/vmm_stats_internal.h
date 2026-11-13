@@ -3,9 +3,11 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "vmm_types.h"
 
 // Accounting hooks used by the MMU implementation.
 void vmm_stats_record_tlb_lookup(bool hit);
 void vmm_stats_record_transfer(bool write, size_t bytes);
+void vmm_note_page_access(Page_Entry *pte);
 
 #endif

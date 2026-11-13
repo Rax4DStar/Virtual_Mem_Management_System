@@ -31,8 +31,21 @@ typedef struct {
 	uint8_t state; //0 empty, 1 occupied, 2 deleted
 } Global_Mapping;
 
+typedef struct Shared_Page {
+	Page_Entry *members;
+	uint32_t references;
+	uint64_t address;
+	uint64_t swap_offset;
+	int16_t frame_index;
+	bool present;
+	bool swapped;
+	bool writable;
+	bool accessed;
+} Shared_Page;
+
 #define global_mapping_capacity (max_table_nodes * max_entries)
 #define registration_index_capacity (max_table_nodes * 2)
+#define max_shared_pages (max_table_nodes * max_entries)
 static Process_Registration process_registry[max_table_nodes];
 static uint16_t process_by_asid[UINT16_MAX + 1u];
 static Registration_Index_Entry process_by_pointer[registration_index_capacity];
@@ -40,6 +53,9 @@ static Registration_Index_Entry process_by_root[registration_index_capacity];
 static uint16_t free_process_slots[max_table_nodes];
 static size_t free_process_count = 0;
 static Global_Mapping global_mappings[global_mapping_capacity];
+static Shared_Page shared_pages[max_shared_pages];
+static uint32_t free_shared_slots[max_shared_pages];
+static size_t free_shared_count = 0;
 /* Translation combines a frame base with the page offset, so every frame must
  begin at an address whose low page-offset bits are zero */
 _Static_assert((page_size & (page_size - 1)) == 0,
@@ -349,6 +365,78 @@ static void replacement_append(int frame_idx) {
 	if (replacement_clock_hand < 0) replacement_clock_hand = (int16_t)frame_idx;
 }
 
+static Shared_Page *shared_page_allocate(void) {
+	if (free_shared_count == 0) return NULL;
+	uint32_t slot = free_shared_slots[--free_shared_count];
+	Shared_Page *shared = &shared_pages[slot];
+	memset(shared, 0, sizeof(*shared));
+	shared->frame_index = -1;
+	return shared;
+}
+
+static void shared_page_release(Shared_Page *shared) {
+	ptrdiff_t slot = shared - shared_pages;
+	memset(shared, 0, sizeof(*shared));
+	free_shared_slots[free_shared_count++] = (uint32_t)slot;
+}
+
+static void shared_member_add(Shared_Page *shared, Page_Entry *pte) {
+	pte->shared_page = shared;
+	pte->shared_prev = NULL;
+	pte->shared_next = shared->members;
+	if (shared->members) shared->members->shared_prev = pte;
+	shared->members = pte;
+	shared->references++;
+}
+
+static void shared_member_remove(Shared_Page *shared, Page_Entry *pte) {
+	if (pte->shared_prev) pte->shared_prev->shared_next = pte->shared_next;
+	else shared->members = pte->shared_next;
+	if (pte->shared_next) pte->shared_next->shared_prev = pte->shared_prev;
+	pte->shared_page = NULL;
+	pte->shared_prev = NULL;
+	pte->shared_next = NULL;
+	shared->references--;
+}
+
+static void shared_sync_members(Shared_Page *shared) {
+	for (Page_Entry *pte = shared->members; pte; pte = pte->shared_next) {
+		pte->address = shared->address;
+		pte->present = shared->present;
+		pte->swapped = shared->swapped;
+		pte->swap_offset = shared->swap_offset;
+		pte->frame_index = shared->frame_index;
+		pte->accessed = shared->accessed;
+	}
+}
+
+static void shared_free_backing(Shared_Page *shared) {
+	if (shared->present && shared->frame_index >= 0 &&
+		shared->frame_index < max_frames) {
+		int frame_idx = shared->frame_index;
+		FrameTracker *frame = &frame_table[frame_idx];
+		if (frame->busy && frame->shared_page == shared) {
+			replacement_remove(frame_idx);
+			physical_free_frame(frame_idx);
+			frame->busy = false;
+			frame->pte = NULL;
+			frame->shared_page = NULL;
+			frame->owner_va = 0;
+			frame->owner_asid = 0;
+		}
+	}
+	if (shared->swapped) swap_slot_release(shared->swap_offset);
+}
+
+static void shared_note_access(Page_Entry *pte) {
+	pte->accessed = true;
+	if (pte->shared_page) pte->shared_page->accessed = true;
+}
+
+void vmm_note_page_access(Page_Entry *pte) {
+	shared_note_access(pte);
+}
+
 static int16_t replacement_select_victim(void) {
 	if (replacement_policy == vmm_replacement_fifo) return replacement_head;
 	if (replacement_clock_hand < 0) replacement_clock_hand = replacement_head;
@@ -358,17 +446,57 @@ static int16_t replacement_select_victim(void) {
 	for (;;) {
 		int16_t candidate = replacement_clock_hand;
 		FrameTracker *frame = &frame_table[candidate];
-		if (!frame->busy || !frame->pte) return -1;
-		Page_Entry *pte = frame->pte;
+		if (!frame->busy || (!frame->pte && !frame->shared_page)) return -1;
 		statistics.clock_page_checks++;
 		replacement_clock_hand = frame->replacement_next >= 0
 			? frame->replacement_next : replacement_head;
-		if (!pte->accessed) return candidate;
-		pte->accessed = false;
+		bool accessed = frame->shared_page
+			? frame->shared_page->accessed : frame->pte->accessed;
+		if (!accessed) return candidate;
+		if (frame->shared_page) {
+			frame->shared_page->accessed = false;
+		} else {
+			frame->pte->accessed = false;
+		}
 	}
 }
 
 static void release_page_mapping(uint64_t va, Page_Entry *pte) {
+	if (pte->shared_page) {
+		Shared_Page *shared = pte->shared_page;
+		tlb_invalidate_vpn(pte->vpn);
+		shared_member_remove(shared, pte);
+		if (shared->references == 0) {
+			shared_free_backing(shared);
+			shared_page_release(shared);
+		} else if (shared->references == 1) {
+			Page_Entry *remaining = shared->members;
+			remaining->copy_on_write = false;
+			remaining->writeable = shared->writable;
+			remaining->accessed = shared->accessed;
+			remaining->shared_page = NULL;
+			remaining->shared_prev = NULL;
+			remaining->shared_next = NULL;
+			if (shared->present && shared->frame_index >= 0 &&
+				shared->frame_index < max_frames) {
+				FrameTracker *frame = &frame_table[shared->frame_index];
+				if (frame->busy && frame->shared_page == shared) {
+					frame->shared_page = NULL;
+					frame->pte = remaining;
+					frame->owner_va = remaining->vpn << 12;
+					frame->owner_asid = remaining->owner_asid;
+				}
+			}
+			tlb_invalidate_vpn(remaining->vpn);
+			shared->members = NULL;
+			shared->references = 0;
+			shared_page_release(shared);
+		}
+		memset(pte, 0, sizeof(*pte));
+		pte->frame_index = -1;
+		return;
+	}
+
 	if (pte->present && pte->frame_index >= 0 && pte->frame_index < max_frames) {
 		int frame_idx = pte->frame_index;
 		FrameTracker *frame = &frame_table[frame_idx];
@@ -377,6 +505,7 @@ static void release_page_mapping(uint64_t va, Page_Entry *pte) {
 			physical_free_frame(frame_idx);
 			frame->busy = false;
 			frame->pte = NULL;
+			frame->shared_page = NULL;
 			frame->owner_va = 0;
 			frame->owner_asid = 0;
 		}
@@ -402,6 +531,11 @@ void vmm_init(void) {
 	}
 	free_process_count = max_table_nodes;
 	memset(global_mappings, 0, sizeof(global_mappings));
+	memset(shared_pages, 0, sizeof(shared_pages));
+	for (uint32_t i = 0; i < max_shared_pages; i++) {
+		free_shared_slots[i] = (uint32_t)(max_shared_pages - 1 - i);
+	}
+	free_shared_count = max_shared_pages;
 	tlb_init();
 	physical_frame_allocator_init();
 	free_swap_count = 0;
@@ -415,6 +549,7 @@ void vmm_init(void) {
 	for (int i = 0; i < max_frames; i++) {
 		frame_table[i].busy = false;
 		frame_table[i].pte = NULL;
+		frame_table[i].shared_page = NULL;
 		frame_table[i].owner_va = 0;
 		frame_table[i].owner_asid = 0;
 		frame_table[i].replacement_prev = -1;
@@ -516,11 +651,72 @@ bool vmm_mmap(Process *process, uint64_t va, bool writable, bool executable,
 	pte->executable = executable;
 	pte->user_mode = user_mode;
 	pte->global_page = global_page;
+	pte->copy_on_write = false;
 	pte->accessed = false;
 	pte->dirty = false;
 	pte->swapped = false;
 	pte->swap_offset = 0;
+	pte->vpn = vpn;
+	pte->owner_asid = process->asid;
 	statistics.mappings++;
+	return true;
+}
+
+bool vmm_mmap_shared(Process *source, uint64_t source_va,
+		Process *target, uint64_t target_va) {
+	if (!source || !source->root || !target || !target->root ||
+		!register_process(source) || !register_process(target)) return false;
+	Page_Entry *source_pte = find_page_entry(source->root, source_va);
+	if (!source_pte || !source_pte->mapped || source_pte->global_page) return false;
+	if (source == target && source_va == target_va) return false;
+	Page_Entry *target_pte = find_page_entry(target->root, target_va);
+	if (target_pte && target_pte->mapped) return false;
+
+	Shared_Page *shared = source_pte->shared_page;
+	bool new_group = shared == NULL;
+	if (new_group) {
+		if (source_pte->present &&
+			(source_pte->frame_index < 0 || source_pte->frame_index >= max_frames ||
+			 !frame_table[source_pte->frame_index].busy ||
+			 frame_table[source_pte->frame_index].pte != source_pte)) return false;
+		shared = shared_page_allocate();
+		if (!shared) return false;
+		shared->address = source_pte->address;
+		shared->swap_offset = source_pte->swap_offset;
+		shared->frame_index = source_pte->frame_index;
+		shared->present = source_pte->present;
+		shared->swapped = source_pte->swapped;
+		shared->writable = source_pte->writeable || source_pte->copy_on_write;
+		shared->accessed = source_pte->accessed;
+	}
+
+	if (!vmm_mmap(target, target_va, shared->writable,
+			source_pte->executable, source_pte->user_mode, false)) {
+		if (new_group) shared_page_release(shared);
+		return false;
+	}
+	target_pte = find_page_entry(target->root, target_va);
+	if (!target_pte || !target_pte->mapped) {
+		if (new_group) shared_page_release(shared);
+		return false;
+	}
+
+	if (new_group) {
+		shared_member_add(shared, source_pte);
+		if (shared->present) {
+			FrameTracker *frame = &frame_table[shared->frame_index];
+			frame->pte = NULL;
+			frame->shared_page = shared;
+		}
+	}
+	shared_member_add(shared, target_pte);
+	shared_sync_members(shared);
+	source_pte->writeable = false;
+	source_pte->copy_on_write = shared->writable;
+	target_pte->writeable = false;
+	target_pte->copy_on_write = shared->writable;
+	tlb_invalidate_vpn(source_pte->vpn);
+	tlb_invalidate_vpn(target_pte->vpn);
 	return true;
 }
 
@@ -605,28 +801,7 @@ void vmm_destroy_page_table(Table_Node *table, int level) {
 		Page_Entry *entry = &table->entries[i];
 
 		if (level == 1) {
-			// Unmapped swapped pages still own a slot in the backing file.
-			if (entry->mapped && entry->swapped) {
-				swap_slot_release(entry->swap_offset);
-			}
-			if (!entry->present) continue;
-
-			// The PTE records its resident frame, avoiding a scan of all frames
-			int frame_idx = entry->frame_index;
-			if (frame_idx >= 0 && frame_idx < max_frames) {
-				FrameTracker *frame = &frame_table[frame_idx];
-				if (frame->busy && frame->pte == entry) {
-					replacement_remove(frame_idx);
-					if (entry->global_page) tlb_invalidate_vpn(frame->owner_va >> 12);
-					else tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
-					physical_free_frame(frame_idx);
-					frame->busy = false;
-					frame->pte = NULL;
-					frame->owner_va = 0;
-					frame->owner_asid = 0;
-				}
-			}
-			entry->frame_index = -1;
+			if (entry->mapped) release_page_mapping(entry->vpn << 12, entry);
 		} else if (entry->present) {
 			// Walk down to child tables before returning this node to the pool
 			vmm_destroy_page_table((Table_Node *)entry->address, level - 1);
@@ -646,7 +821,8 @@ static uint8_t vmm_evict_frame(void) {
 	uint8_t victim = (uint8_t)victim_idx;
 	FrameTracker *frame = &frame_table[victim];
 	Page_Entry *pte = frame->pte;
-	if (!frame->busy || !pte) {
+	Shared_Page *shared = frame->shared_page;
+	if (!frame->busy || (!pte && !shared)) {
 		fprintf(stderr, "[VMM Error] Replacement queue contains an invalid frame.\n");
 		exit(EXIT_FAILURE);
 	}
@@ -664,18 +840,31 @@ static uint8_t vmm_evict_frame(void) {
 	}
 	statistics.page_evictions++;
 	statistics.swap_page_outs++;
-	pte->swap_offset = swap_offset;
-	pte->dirty = false;
-	pte->present = false;
-	pte->swapped = true;
-	pte->frame_index = -1;
-
-	// Remove the old owner and its cached translation before frame reuse
-	if (pte->global_page) tlb_invalidate_vpn(frame->owner_va >> 12);
-	else tlb_invalidate_asid(frame->owner_va >> 12, frame->owner_asid);
+	if (shared) {
+		shared->address = 0;
+		shared->swap_offset = swap_offset;
+		shared->frame_index = -1;
+		shared->present = false;
+		shared->swapped = true;
+		shared->accessed = false;
+		shared_sync_members(shared);
+		for (Page_Entry *member = shared->members; member;
+			member = member->shared_next) {
+			tlb_invalidate_vpn(member->vpn);
+		}
+	} else {
+		pte->swap_offset = swap_offset;
+		pte->dirty = false;
+		pte->present = false;
+		pte->swapped = true;
+		pte->frame_index = -1;
+		pte->address = 0;
+		tlb_invalidate_vpn(pte->vpn);
+	}
 	replacement_remove(victim);
 	frame->busy = false;
 	frame->pte = NULL;
+	frame->shared_page = NULL;
 	frame->owner_va = 0;
 	frame->owner_asid = 0;
 	return victim;
@@ -698,15 +887,16 @@ MMU_Result vmm_handle_page_fault(Page_Entry *pte, uint64_t va,
 	if (frame_idx == -1) frame_idx = vmm_evict_frame();
 
 	// Restore a swapped page, or start a new mapping with zero-filled memory
-	bool swapped_in = pte->swapped;
+	Shared_Page *shared = pte->shared_page;
+	bool swapped_in = shared ? shared->swapped : pte->swapped;
+	uint64_t swap_offset = shared ? shared->swap_offset : pte->swap_offset;
 	if (swapped_in) {
-		if (!swap_seek(pte->swap_offset) ||
+		if (!swap_seek(swap_offset) ||
 			fread(physical_memory[frame_idx], 1, page_size, swap_file) != page_size) {
 			perror("Failed to read page from swap");
 			exit(EXIT_FAILURE);
 		}
-		swap_slot_release(pte->swap_offset);
-		pte->swap_offset = 0;
+		swap_slot_release(swap_offset);
 	} else {
 		memset(physical_memory[frame_idx], 0, page_size);
 	}
@@ -714,19 +904,105 @@ MMU_Result vmm_handle_page_fault(Page_Entry *pte, uint64_t va,
 	if (swapped_in) statistics.swap_page_ins++;
 	else statistics.zero_fill_page_ins++;
 
-	pte->address = (uint64_t)physical_memory[frame_idx];
-	pte->present = true;
-	pte->swapped = false;
-	pte->frame_index = (int16_t)frame_idx;
+	if (shared) {
+		shared->address = (uint64_t)physical_memory[frame_idx];
+		shared->swap_offset = 0;
+		shared->frame_index = (int16_t)frame_idx;
+		shared->present = true;
+		shared->swapped = false;
+		shared->accessed = true;
+		shared_sync_members(shared);
+	} else {
+		pte->address = (uint64_t)physical_memory[frame_idx];
+		pte->present = true;
+		pte->swapped = false;
+		pte->swap_offset = 0;
+		pte->frame_index = (int16_t)frame_idx;
+		pte->accessed = true;
+	}
 
 	frame_table[frame_idx].busy = true;
-	frame_table[frame_idx].pte = pte;
+	frame_table[frame_idx].pte = shared ? NULL : pte;
+	frame_table[frame_idx].shared_page = shared;
 	frame_table[frame_idx].owner_va = va;
 	frame_table[frame_idx].owner_asid = current_process->asid;
 	replacement_append(frame_idx);
 
 	// Return the frame base; the MMU adds the virtual page offset.
-	*frame_base = pte->address;
+	*frame_base = shared ? shared->address : pte->address;
+	return mmu_ok;
+}
+
+MMU_Result vmm_resolve_copy_on_write(Page_Entry *pte, Access_Type access,
+		bool is_user) {
+	if (!pte || !pte->mapped || !pte->shared_page) return mmu_fault_invalid_argument;
+	if (is_user && !pte->user_mode) return mmu_fault_privilege;
+	if ((access & access_read) && !pte->readable) return mmu_fault_read_permission;
+	if ((access & access_exec) && !pte->executable) return mmu_fault_execute_permission;
+	if (!(access & access_write) || !pte->copy_on_write) {
+		return mmu_fault_write_permission;
+	}
+
+	Shared_Page *shared = pte->shared_page;
+	if (!shared->writable) return mmu_fault_write_permission;
+	if (shared->references == 1) {
+		shared_member_remove(shared, pte);
+		pte->writeable = true;
+		pte->copy_on_write = false;
+		pte->accessed = shared->accessed;
+		if (shared->present && shared->frame_index >= 0 &&
+			shared->frame_index < max_frames) {
+			FrameTracker *frame = &frame_table[shared->frame_index];
+			if (frame->busy && frame->shared_page == shared) {
+				frame->shared_page = NULL;
+				frame->pte = pte;
+				frame->owner_va = pte->vpn << 12;
+				frame->owner_asid = pte->owner_asid;
+			}
+		}
+		shared_page_release(shared);
+		tlb_invalidate_vpn(pte->vpn);
+		statistics.copy_on_write_faults++;
+		return mmu_ok;
+	}
+	if (shared->references < 2) return mmu_fault_invalid_argument;
+
+	if (!pte->present) {
+		uint64_t frame_base;
+		MMU_Result result = vmm_handle_page_fault(pte, pte->vpn << 12,
+			access_read, is_user, &frame_base);
+		if (result != mmu_ok) return result;
+	}
+
+	// Preserve the source bytes even if allocating the private frame evicts it.
+	uint8_t page_copy[page_size];
+	memcpy(page_copy, (void *)(uintptr_t)pte->address, page_size);
+	int frame_idx = physical_frame_alloc();
+	if (frame_idx == -1) frame_idx = vmm_evict_frame();
+	bool writable = shared->writable;
+	shared_member_remove(shared, pte);
+	memcpy(physical_memory[frame_idx], page_copy, page_size);
+
+	pte->shared_page = NULL;
+	pte->shared_prev = NULL;
+	pte->shared_next = NULL;
+	pte->address = (uint64_t)physical_memory[frame_idx];
+	pte->present = true;
+	pte->swapped = false;
+	pte->swap_offset = 0;
+	pte->frame_index = (int16_t)frame_idx;
+	pte->writeable = writable;
+	pte->copy_on_write = false;
+	pte->accessed = true;
+	pte->dirty = (access & access_write) != 0;
+	frame_table[frame_idx].busy = true;
+	frame_table[frame_idx].pte = pte;
+	frame_table[frame_idx].shared_page = NULL;
+	frame_table[frame_idx].owner_va = pte->vpn << 12;
+	frame_table[frame_idx].owner_asid = pte->owner_asid;
+	replacement_append(frame_idx);
+	tlb_invalidate_vpn(pte->vpn);
+	statistics.copy_on_write_faults++;
 	return mmu_ok;
 }
 
