@@ -882,7 +882,9 @@ MMU_Result vmm_handle_page_fault(Page_Entry *pte, uint64_t va,
 	if ((access & access_exec) && !pte->executable) return mmu_fault_execute_permission;
 	if (is_user && !pte->user_mode) return mmu_fault_privilege;
 
+#ifndef VMM_QUIET
 	printf("[VMM Fault Handler] Demand paging VA 0x%012" PRIX64 "...\n", va);
+#endif
 	int frame_idx = physical_frame_alloc();
 	if (frame_idx == -1) frame_idx = vmm_evict_frame();
 

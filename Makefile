@@ -7,7 +7,7 @@ DOCKER_IMAGE ?= virtual-memory-system
 
 VMM_SOURCES = src/Frame_Alloc.c src/mmu.c src/node.c src/tlb.c src/vmm.c
 
-.PHONY: all run test clean docker-build docker-run docker-test
+.PHONY: all run test benchmark clean docker-build docker-run docker-test
 
 all: $(BUILD_DIR)/vmm_demo
 
@@ -20,11 +20,17 @@ $(BUILD_DIR)/vmm_demo: $(VMM_SOURCES) src/main.c | $(BUILD_DIR)
 $(BUILD_DIR)/test_vmm: $(VMM_SOURCES) tests/test_vmm.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(VMM_SOURCES) tests/test_vmm.c -o $@
 
+$(BUILD_DIR)/replacement_benchmark: $(VMM_SOURCES) src/benchmark_replacement.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DVMM_QUIET $(VMM_SOURCES) src/benchmark_replacement.c -o $@
+
 run: $(BUILD_DIR)/vmm_demo
 	cd $(BUILD_DIR) && ./vmm_demo
 
 test: $(BUILD_DIR)/test_vmm
 	cd $(BUILD_DIR) && ./test_vmm
+
+benchmark: $(BUILD_DIR)/replacement_benchmark
+	cd $(BUILD_DIR) && ./replacement_benchmark
 
 docker-build:
 	$(DOCKER) build -t $(DOCKER_IMAGE) .
